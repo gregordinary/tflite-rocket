@@ -1,0 +1,37 @@
+# Frigate with the RK3588 NPU (rocket) detector.
+#
+# Build the image first — see frigate/README.md: build the delegate .so on an RK3588
+# host, stage it (and the model) into this directory, then `docker compose build`.
+# Then `docker compose up -d`.
+
+services:
+  frigate:
+    container_name: frigate
+    image: frigate-rocket:0.17.2
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    shm_size: "1024mb" # raise for more/larger cameras (Frigate logs the required size)
+    environment:
+      # The headers-only delegate binds the TFLite C-API symbols at dlopen; preload the
+      # shim that provides them (baked into the image). Harmless to non-TFLite processes.
+      LD_PRELOAD: /usr/local/lib/libtflite_cshim.so
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0 # the RK3588 NPU
+      - /dev/dri:/dev/dri # rkmpp hardware video decode (real cameras)
+    group_add:
+      - "988" # host 'render' gid that owns /dev/accel0 — confirm with `getent group render`
+    volumes:
+      - ./config.yml:/config/config.yml:ro
+      - ./media:/media/frigate
+      - /etc/localtime:/etc/localtime:ro
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1000000000
+    ports:
+      - "8971:8971" # authenticated UI + API
+      - "8554:8554" # go2rtc RTSP
+      - "8555:8555/tcp" # go2rtc WebRTC
+      - "8555:8555/udp"

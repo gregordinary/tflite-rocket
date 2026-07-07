@@ -1,0 +1,7 @@
+# Build artifacts staged into this directory before `docker compose build`
+# (built on an RK3588 host — see README.md). Not checked in.
+libtflite_rocket.so
+*.tflite
+
+# Recorded sample clips / camera media and Frigate's runtime state.
+media/

@@ -1,0 +1,7 @@
+# Keep the build context to just the image inputs (rocket.py + the staged .so +
+# model). Everything else is mounted at runtime or is documentation.
+media/
+docker-compose.yml
+config.yml
+README.md
+*.md

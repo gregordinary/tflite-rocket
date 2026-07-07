@@ -1,0 +1,62 @@
+# Frigate configuration — RK3588 NPU (rocket) detector.
+#
+# This config drives the `rocket` detector (rocket.py) against an SSDLite-MobileDet
+# model on a looped sample clip (made by ./make-sample-clip.sh). Swap the camera block
+# for a real camera once it works — see README.
+
+mqtt:
+  enabled: false
+
+detectors:
+  # One detector fanning a single inference across the NPU cores (lowest latency).
+  # For multi-camera throughput, define several (rocket0, rocket1, ...) each with a
+  # distinct `device` (an A76 core "4".."7") and `num_threads: 1` — Frigate runs one
+  # process per detector, so they spread across the big cores. See frigate/README.md.
+  rocket:
+    type: rocket
+    num_threads: 4
+
+model:
+  # SSDLite-MobileDet (uint8) — Frigate's default CPU SSD model, validated on the NPU
+  # at COCO mAP = CPU parity. Mounted/baked at this path by the compose/Dockerfile.
+  path: /models/rocket_mobiledet.tflite
+  width: 320
+  height: 320
+  input_tensor: nhwc
+  input_pixel_format: rgb
+  input_dtype: int
+  model_type: ssd
+
+# Bring-up source: loop a recorded clip in real time (-re -stream_loop -1). Swap this
+# whole camera block for a real camera's RTSP URL once it works — see README.
+cameras:
+  test_cam:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: /media/frigate/sample.mp4
+          input_args:
+            - -re
+            - -stream_loop
+            - "-1"
+          roles:
+            - detect
+    detect:
+      enabled: true
+      width: 1280
+      height: 720
+      fps: 5
+    motion:
+      # Lower the motion threshold so the synthetic bring-up clip reliably triggers
+      # detection. A real camera does not need this — delete this block when you wire one.
+      threshold: 18
+      contour_area: 8
+    objects:
+      track:
+        - person
+        - bicycle
+        - car
+        - bus
+        - motorcycle
+        - cat
+        - dog
