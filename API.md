@@ -158,6 +158,21 @@ dependency resolves via
 `find_package(rocketnpu)` if installed, else from a sibling `rocket-userspace` checkout
 (override with `-DROCKETNPU_DIR=/path/to/rocket-userspace`).
 
+### Recommended configuration
+
+For a detector (Frigate's regime), the two settings that matter:
+
+- **`native_int8=1`** — run the int8/uint8 convs on the exact int8 datapath (the default in the Frigate
+  `rocket.py` plugin). COCO mAP is CPU-parity (MobileDet 0.3321 vs 0.3318 [HW sweep]); `mm_int8=1`
+  (default under it) routes 1×1 convs to the resident int8 matmul. Leave `aux_ops=1` (the default) so the
+  host elementwise/pool/activation ops are claimed and fused; the opt-in on-NPU routes (`act_npu`,
+  `pool_npu`, …) are A/B knobs, not throughput wins — the host kernel is exact and free.
+- **Throughput comes from a process pool, not a faster single stream.** A single inference is host
+  cube-gather-bound (~336 ms warm), so scale with **one delegate process per camera**, each pinned to a
+  distinct A76 core via the `ROCKET_CPU_AFFINITY` env var: 3.20 → 9.55 detection_fps at P=1→4 (2.98×,
+  live Frigate). `nthreads` (default 4) fans a single conv across the 3 NPU cores; the pool fans across
+  streams — the pool is the larger lever.
+
 `ROCKET_PROF_POOL=1` (env, off by default, zero cost when unset) tallies the host `parallel_oh`
 fan-out — fan-out calls, threads spawned, and total wall in the fan-out regions — and prints one
 `[rocket-pool-probe]` line at exit. It exists to weigh a would-be persistent worker pool against the
