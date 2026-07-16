@@ -1758,8 +1758,14 @@ static void po_probe_dump() {
 static bool po_probe_on() {
     if (g_po_probe < 0) {
         const char *e = getenv("ROCKET_PROF_POOL");
-        g_po_probe = (e && *e && strcmp(e, "0")) ? 1 : 0;
-        if (g_po_probe) atexit(po_probe_dump);
+        const int on = (e && *e && strcmp(e, "0")) ? 1 : 0;
+        // Register the exit dump EXACTLY once. Under a multi-interpreter pool (Frigate P=1->4)
+        // two threads can reach this check-then-set concurrently: the g_po_probe write is benign
+        // (both compute the same `on`), but a double atexit(po_probe_dump) would print the probe
+        // line twice. An atomic test-and-set gates the registration to the first arrival.
+        static std::atomic<bool> registered{false};
+        if (on && !registered.exchange(true)) atexit(po_probe_dump);
+        g_po_probe = on;
     }
     return g_po_probe;
 }
