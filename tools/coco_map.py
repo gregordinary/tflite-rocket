@@ -4,15 +4,22 @@
 # delegate (native_int8). The model carries TFLite_Detection_PostProcess, so its 4 outputs
 # ARE detections (boxes [ymin,xmin,ymax,xmax] normalized, classes, scores, count) — no NMS.
 #
+# A detector's output list is NMS-ORDERED, so one count of arithmetic drift reorders or
+# drops a box and an element-wise comparison against the CPU says nothing. mAP over a real
+# image set is the comparison that survives that, and the DELTA between the two arms is the
+# assertion — the absolute depends on which images are in the set.
+#
 # Usage:
 #   coco_map.py <model.tflite> [--delegate <so> [--option k=v ...]] \
-#               [--images DIR] [--ann JSON] [--limit N] [--score-thr T]
+#               [--images DIR] [--ann JSON] [--limit N] [--score-thr T] [--dump PREFIX]
 # CPU-only (no --delegate) validates the index->coco_id map + preprocessing: a correct
 # pipeline gives MobileDet ~0.22-0.25 mAP; a wrong class map gives ~0.
+#
+# The interpreter comes from tflite_runtime, ai_edge_litert or tensorflow, whichever is
+# installed — an aarch64 board has the first two and no TFLite build.
 import argparse, json, os, sys
 import numpy as np
 from PIL import Image
-import tensorflow as tf
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
@@ -36,12 +43,28 @@ def parse_options(pairs, parser):
         opts[k] = v
     return opts
 
-def load_delegate_iface():
-    return tf.lite.experimental.load_delegate
+def load_tflite():
+    """The interpreter, from whichever of the three packages this host has.
+
+    BUILTIN_WITHOUT_DEFAULT_DELEGATES stops XNNPACK claiming the convolutions before the
+    external delegate gets a turn, and BOTH arms use it, so the two differ in the rocket
+    delegate alone rather than in which CPU kernels ran.
+    """
+    try:
+        from tflite_runtime.interpreter import Interpreter, load_delegate, OpResolverType
+    except ImportError:
+        try:
+            from ai_edge_litert.interpreter import Interpreter, load_delegate, OpResolverType
+        except ImportError:
+            import tensorflow as tf
+            return (tf.lite.Interpreter, tf.lite.experimental.load_delegate, None)
+    return Interpreter, load_delegate, OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
 
 def make_interp(model, delegate_so=None, opts=None):
-    dl = [tf.lite.experimental.load_delegate(delegate_so, options=opts)] if delegate_so else None
-    it = tf.lite.Interpreter(model_path=model, experimental_delegates=dl)
+    Interpreter, load_delegate, resolver = load_tflite()
+    dl = [load_delegate(delegate_so, options=opts)] if delegate_so else None
+    kw = {"experimental_op_resolver_type": resolver} if resolver is not None else {}
+    it = Interpreter(model_path=model, experimental_delegates=dl, **kw)
     it.allocate_tensors()
     return it
 
@@ -130,6 +153,8 @@ def main():
     ap.add_argument("--ann", default="/tmp/coco/annotations/instances_val2017.json")
     ap.add_argument("--limit", type=int, default=100)
     ap.add_argument("--score-thr", type=float, default=0.01)
+    ap.add_argument("--dump", default=None,
+                    help="write each arm's detections to <DUMP>.cpu.json / <DUMP>.delegate.json")
     args = ap.parse_args()
 
     coco_gt = COCO(args.ann)
@@ -138,16 +163,26 @@ def main():
     ids = [i for i in sorted(all_imgs) if i in have][:args.limit]
     print(f"evaluating {len(ids)} images")
 
+    def dump(arm, res):
+        if args.dump:
+            with open(f"{args.dump}.{arm}.json", "w") as f:
+                json.dump(res, f)
+            print(f"  wrote {len(res)} detections to {args.dump}.{arm}.json")
+
     print("== CPU TFLite ==")
     cpu = make_interp(args.model)
-    cpu_map = evaluate(coco_gt, detections(cpu, ids, all_imgs, args.images, args.score_thr), ids)
+    cpu_res = detections(cpu, ids, all_imgs, args.images, args.score_thr)
+    dump("cpu", cpu_res)
+    cpu_map = evaluate(coco_gt, cpu_res, ids)
 
     deleg_map = None
     if args.delegate:
         opts = parse_options(args.option, ap)
         print(f"== rocket delegate {opts} ==")
         npu = make_interp(args.model, args.delegate, opts)
-        deleg_map = evaluate(coco_gt, detections(npu, ids, all_imgs, args.images, args.score_thr), ids)
+        npu_res = detections(npu, ids, all_imgs, args.images, args.score_thr)
+        dump("delegate", npu_res)
+        deleg_map = evaluate(coco_gt, npu_res, ids)
 
     print("\n==== SUMMARY ====")
     print(f"  CPU      mAP@[.5:.95] = {cpu_map:.4f}")

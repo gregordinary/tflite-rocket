@@ -100,6 +100,80 @@ inline bool quant1(const TfLiteTensor &t, float *scale, int *zp) {
     return true;
 }
 
+// TFLite [OC,KH,KW,IC] -> the library's [OC,IC,KH,KW]; depthwise [1,KH,KW,C] -> [C,KH,KW].
+// Rebased into int8 in the same pass. At namespace scope because the CLAIM gate needs it as
+// well as the packer: a per-axis layer's accuracy bound is a question about the weights, and
+// a depthwise filter's channel is STRIDED in TFLite's layout, so the per-channel sums the
+// bound is built from are wrong unless the transpose has happened first.
+inline bool transpose_weights(const TfLiteTensor &f, bool dw, std::vector<int8_t> *w) {
+    const int KH = f.dims->data[1], KW = f.dims->data[2];
+    const int sh = shift_of(f.type);
+    const uint8_t *src = reinterpret_cast<const uint8_t *>(f.data.data);
+    if (!src) return false;
+    if (dw) {
+        const int C = f.dims->data[3];
+        w->assign((size_t)C * KH * KW, 0);
+        for (int c = 0; c < C; c++)
+            for (int y = 0; y < KH; y++)
+                for (int x = 0; x < KW; x++)
+                    (*w)[((size_t)c * KH + y) * KW + x] =
+                        (int8_t)((int)src[((size_t)y * KW + x) * C + c] - sh);
+        return true;
+    }
+    const int OC = f.dims->data[0], IC = f.dims->data[3];
+    w->assign((size_t)OC * IC * KH * KW, 0);
+    for (int oc = 0; oc < OC; oc++)
+        for (int ic = 0; ic < IC; ic++)
+            for (int y = 0; y < KH; y++)
+                for (int x = 0; x < KW; x++)
+                    (*w)[(((size_t)oc * IC + ic) * KH + y) * KW + x] =
+                        (int8_t)((int)src[(((size_t)oc * KH + y) * KW + x) * IC + ic] - sh);
+    return true;
+}
+
+// WHETHER A PER-AXIS CONVOLUTION'S SCALE SPREAD HAS AN EXPRESSION ON THIS PART, asked of
+// the library rather than decided here. A tile is one task and a task carries one OUT_CVT
+// shift, so a channel reaches its own scale only through the int16 C in its coefficient
+// group; past what that ramp spans the layer computes a full, correctly sized, entirely
+// plausible surface at a gain that is wrong by a factor. It has to be asked HERE because
+// the library's own refusal at Prepare would fail the whole model, where an unclaimed node
+// is one TFLite runs itself.
+//
+// Per-tensor filters are not this question and pass straight through. The cost is one
+// weight transpose per candidate per-axis convolution, at load.
+inline bool peraxis_ok(const TfLiteTensor &f, const TfLiteTensor &b, bool dw, int IC,
+                       float in_scale, int in_zp, float out_scale, int out_zp) {
+    if (f.quantization.type != kTfLiteAffineQuantization || !f.quantization.params)
+        return true;
+    const auto *aq =
+        reinterpret_cast<const TfLiteAffineQuantization *>(f.quantization.params);
+    if (!aq->scale || aq->scale->size <= 1) return true;
+    const int OC = dw ? f.dims->data[3] : f.dims->data[0];
+    if (aq->scale->size != OC || !b.data.i32) return false;
+    std::vector<int8_t> w;
+    if (!transpose_weights(f, dw, &w)) return false;
+    rocket_conv2d_desc d;
+    std::memset(&d, 0, sizeof d);
+    d.ic = dw ? OC : IC;
+    d.oc = OC;
+    d.kh = f.dims->data[1];
+    d.kw = f.dims->data[2];
+    d.depthwise = dw;
+    // A narrow per-axis convolution can only be the ordinary encoding: the packed-image
+    // first conv refuses a per-axis quantization, so pack() will hand it the same flag.
+    d.direct_datapath = (!dw && IC <= 4) ? 1 : 0;
+    // Only the ACCURACY refusal is a claim answer. ROCKET_E_SHAPE says this path does not
+    // take the descriptor at all, which is a question the rest of the gate owns.
+    //
+    // The OUTPUT quantization is part of the question, not bookkeeping: a clamped channel
+    // whose filter is all zero reaches one accumulator, and whether its wrong gain changes
+    // a byte depends on where that value sits against the saturation rails.
+    return rocket_conv2d_int8_perchannel_plan_rk3576(&d, w.data(), b.data.i32, in_scale,
+                                                     aq->scale->data, out_scale, in_zp,
+                                                     out_zp, nullptr, nullptr)
+           != ROCKET_E_UNSUPPORTED;
+}
+
 // TFLite's own padding resolution, as an explicit (out, lead, trail). `trail` is the pad
 // the LAST WINDOW CONSUMES — what the CNA derives from the output extent and the leading
 // pad — and it can be smaller than the pad the model declares: a stride-2 3x3 padding one
@@ -180,6 +254,7 @@ inline bool kind_supported(const TfLiteRegistration *reg, const TfLiteNode *node
         if (!quant1(in, &isc, &izp)) return false;
         int sy, sx, dy, dx;
         TfLiteFusedActivation act;
+        TfLitePadding pad;
         if (dw) {
             const auto *p =
                 reinterpret_cast<const TfLiteDepthwiseConvParams *>(node->builtin_data);
@@ -187,12 +262,14 @@ inline bool kind_supported(const TfLiteRegistration *reg, const TfLiteNode *node
             sy = p->stride_height; sx = p->stride_width;
             dy = p->dilation_height_factor; dx = p->dilation_width_factor;
             act = p->activation;
+            pad = p->padding;
         } else {
             const auto *p = reinterpret_cast<const TfLiteConvParams *>(node->builtin_data);
             if (!p) return false;
             sy = p->stride_height; sx = p->stride_width;
             dy = p->dilation_height_factor; dx = p->dilation_width_factor;
             act = p->activation;
+            pad = p->padding;
         }
         if (sy < 1 || sx < 1) return false;
         // DILATION is refused in the library's own RK3576 check and has never been driven
@@ -206,7 +283,39 @@ inline bool kind_supported(const TfLiteRegistration *reg, const TfLiteNode *node
         // model, where an unclaimed node is just one TFLite runs itself. No classifier in
         // the corpus has one; an SSD head does.
         if (dw && in.dims->data[3] <= 4) return false;
-        return act_is_free(act, osc, ozp, o.type);
+        if (!act_is_free(act, osc, ozp, o.type)) return false;
+        // AND THE PART'S GEOMETRY BOUNDS, ASKED RATHER THAN ASSUMED — the resident weight
+        // slice and the row window, neither of which any inspection of this node could
+        // predict and both of which the pack reaches. Same reason as the pool's plan call
+        // below: a refusal here costs one node TFLite runs itself, where the same refusal
+        // at Prepare fails the whole model.
+        //
+        // The geometry is the node's OWN, before an explicit PAD is folded into it. That
+        // is sound rather than merely conservative: a fold makes the plane taller, and the
+        // row window's refusal ("no window fits at all") is a function of the plane WIDTH,
+        // the channel counts and the kernel — not of its height, which only decides how
+        // many tasks the window is cut into.
+        {
+            rocket_conv2d_desc gd;
+            std::memset(&gd, 0, sizeof gd);
+            gd.ic = in.dims->data[3];
+            gd.oc = dw ? in.dims->data[3] : f.dims->data[0];
+            gd.ih = in.dims->data[1]; gd.iw = in.dims->data[2];
+            gd.kh = f.dims->data[1];  gd.kw = f.dims->data[2];
+            gd.stride_y = sy; gd.stride_x = sx;
+            gd.dil_y = 1; gd.dil_x = 1;
+            gd.depthwise = dw;
+            int oh, ow, ly, lx, ty, tx;
+            resolve_pad(gd.ih, gd.kh, sy, pad, -1, 0, &oh, &ly, &ty);
+            resolve_pad(gd.iw, gd.kw, sx, pad, -1, 0, &ow, &lx, &tx);
+            gd.pad_top = ly; gd.pad_left = lx;
+            gd.direct_datapath = (!dw && gd.ic <= 4) ? 1 : 0;
+            if (rocket_conv2d_int8_plan_rk3576(&gd) != ROCKET_OK) return false;
+        }
+        // AND THE PART'S PER-AXIS ACCURACY BOUND, ASKED RATHER THAN ASSUMED — the same
+        // pure library check the pack will apply, so a claim made here cannot fail there.
+        return peraxis_ok(f, b, dw, in.dims->data[3], isc, izp - shift_of(in.type), osc,
+                          ozp - shift_of(o.type));
     }
     case kTfLiteBuiltinAveragePool2d:
     case kTfLiteBuiltinMaxPool2d: {
@@ -575,6 +684,14 @@ public:
             const bool escapes = part_out_.count(L.out_t) && has_inside_consumer(i);
             G.conv = escapes ? nullptr : L.conv;
             G.pool = escapes ? nullptr : L.pool;
+            // A CONCATENATION HAS NO HANDLE TO HIDE, so it says the same thing through the
+            // description's own flag. Placing one wires its operands into slices of a
+            // buffer its consumers read as a cube and leaves it owning no row-major
+            // tensor, which for a partition output is a surface the runtime reads and
+            // nothing writes. Set on every partition output rather than only where there
+            // is an inside consumer: the planner places a concatenation only when one
+            // exists, so the wider condition costs nothing and states the fact plainly.
+            G.row_major_out = part_out_.count(L.out_t) ? 1u : 0u;
         }
 
         plan_ = rocket_graph_plan_new(fd_, graph_.data(), (unsigned)graph_.size(),
@@ -593,9 +710,11 @@ public:
             L.buf.assign((size_t)L.oc * L.oh * L.ow, 0);
         }
         // A partition output with no row-major tensor would be a silent wrong answer, so
-        // it is a loud refusal here instead. Unreachable through the rule above for a
-        // convolution or a pool; a CONCATENATION has no handle to hide, so this is the one
-        // that catches it.
+        // it is a loud refusal here instead. Both routes to it are now closed above — a
+        // convolution or a pool by its hidden handle, a concatenation by `row_major_out` —
+        // so this is the assertion that they are, and not a path a model reaches. It stays
+        // because the alternative to reaching it is a surface the runtime reads and
+        // nothing writes.
         for (size_t i = 0; i < layers_.size(); i++)
             if (part_out_.count(layers_[i].out_t) && layers_[i].buf.empty()) {
                 std::fprintf(stderr, "[rocket/rk3576] layer %zu is a partition output and "
@@ -917,33 +1036,8 @@ private:
         return true;
     }
 
-    // TFLite [OC,KH,KW,IC] -> the library's [OC,IC,KH,KW]; depthwise [1,KH,KW,C] ->
-    // [C,KH,KW]. Rebased into int8 in the same pass.
     static bool take_weights(const TfLiteTensor &f, bool dw, Layer *L) {
-        const int KH = f.dims->data[1], KW = f.dims->data[2];
-        const int sh = shift_of(f.type);
-        const uint8_t *src = reinterpret_cast<const uint8_t *>(f.data.data);
-        if (!src) return false;
-        if (dw) {
-            const int C = f.dims->data[3];
-            L->w.assign((size_t)C * KH * KW, 0);
-            for (int c = 0; c < C; c++)
-                for (int y = 0; y < KH; y++)
-                    for (int x = 0; x < KW; x++)
-                        L->w[((size_t)c * KH + y) * KW + x] =
-                            (int8_t)((int)src[((size_t)y * KW + x) * C + c] - sh);
-            return true;
-        }
-        const int OC = f.dims->data[0], IC = f.dims->data[3];
-        L->w.assign((size_t)OC * IC * KH * KW, 0);
-        for (int oc = 0; oc < OC; oc++)
-            for (int ic = 0; ic < IC; ic++)
-                for (int y = 0; y < KH; y++)
-                    for (int x = 0; x < KW; x++)
-                        L->w[(((size_t)oc * IC + ic) * KH + y) * KW + x] =
-                            (int8_t)((int)src[(((size_t)oc * KH + y) * KW + x) * IC + ic]
-                                     - sh);
-        return true;
+        return transpose_weights(f, dw, &L->w);
     }
 
     // ---- the resident handle ----------------------------------------------

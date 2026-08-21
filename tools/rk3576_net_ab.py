@@ -59,12 +59,17 @@ def feed(detail, image):
     return a[None, ...]
 
 
-def run(Interpreter, model, delegates, ndr, x, iters):
+def make(Interpreter, model, delegates, ndr):
     kw = {}
     if delegates:
         kw["experimental_op_resolver_type"] = ndr
     interp = Interpreter(model_path=model, experimental_delegates=delegates, **kw)
     interp.allocate_tensors()
+    return interp
+
+
+def run(Interpreter, model, delegates, ndr, x, iters):
+    interp = make(Interpreter, model, delegates, ndr)
     inp = interp.get_input_details()[0]
     interp.set_tensor(inp["index"], x)
     walls = []
@@ -81,18 +86,80 @@ def top5(v):
     return list(np.argsort(-v.astype(np.int32))[:5])
 
 
+def agree_over_set(Interpreter, load_delegate, ndr, args, opts):
+    """Top-1 agreement over a DIRECTORY of images, as a rate.
+
+    One image is one sample. The two arms requantize differently — this DPU has a 15-bit
+    multiplier rounding ties to even where TFLite has 31 bits rounding half away from zero
+    — so they disagree wherever the top two logits are within the drift that produces, and
+    the RATE of that is the quantity, not any single label.
+
+    That rate only means something against a CONTROL: run the same set through the
+    per-tensor build of the same architecture. A per-axis defect has no symptom other than
+    the label (a detector would show it only as a mAP loss), so the comparison of the two
+    rates is what says whether per-axis costs anything.
+    """
+    import os
+    from PIL import Image as PILImage
+    exts = (".jpg", ".jpeg", ".png", ".bmp")
+    files = sorted(f for f in os.listdir(args.images) if f.lower().endswith(exts))
+    files = files[:args.limit] if args.limit else files
+
+    base = make(Interpreter, args.model, None, ndr)
+    npu = make(Interpreter, args.model, [load_delegate(args.delegate, options=opts)], ndr)
+    in_ref, in_npu = base.get_input_details()[0], npu.get_input_details()[0]
+    out_ref, out_npu = base.get_output_details()[0], npu.get_output_details()[0]
+
+    agree = 0
+    diff_frac, disagreed = [], []
+    for f in files:
+        x = feed(in_ref, os.path.join(args.images, f))
+        base.set_tensor(in_ref["index"], x); base.invoke()
+        npu.set_tensor(in_npu["index"], x); npu.invoke()
+        r = base.get_tensor(out_ref["index"]).reshape(-1)
+        g = npu.get_tensor(out_npu["index"]).reshape(-1)
+        diff_frac.append(float((g != r).sum()) / g.size)
+        if top5(g)[0] == top5(r)[0]:
+            agree += 1
+        else:
+            disagreed.append(f)
+
+    n = len(files)
+    rate = agree / n if n else 0.0
+    print(f"\n{args.model}")
+    print(f"   top-1 agrees on {agree} of {n} images ({100.0 * rate:.2f}%)")
+    print(f"   logits differing: mean {100.0 * statistics.mean(diff_frac):.3f}% "
+          f"of elements per image")
+    if disagreed:
+        print("   disagreed on: " + ", ".join(disagreed[:12])
+              + (" ..." if len(disagreed) > 12 else ""))
+    if rate < args.min_agree:
+        print(f"   BELOW --min-agree {args.min_agree}")
+        return 1
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("--delegate", required=True)
     ap.add_argument("--option", action="append", default=[])
     ap.add_argument("--image")
+    ap.add_argument("--images", help="score top-1 agreement over a directory of images")
+    ap.add_argument("--limit", type=int, default=0)
+    # PLACED BETWEEN TWO MEASURED REGIMES, not fitted to one. A healthy arm reads 89-93% on
+    # this set — the two arms requantize differently, so they part on near-ties — and a
+    # per-axis path with a defect in it read 0%. Anything tighter fails the healthy control.
+    ap.add_argument("--min-agree", type=float, default=0.5)
     ap.add_argument("--labels")
     ap.add_argument("--iters", type=int, default=20)
     args = ap.parse_args()
 
     Interpreter, load_delegate, ndr = load_tflite()
     opts = dict(kv.split("=", 1) for kv in args.option)
+
+    if args.images:
+        return agree_over_set(Interpreter, load_delegate, ndr, args, opts)
 
     base = Interpreter(model_path=args.model)
     base.allocate_tensors()

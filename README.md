@@ -90,15 +90,30 @@ RK3576 (H96 MAX M9, kernel 7.1.6, 786 MHz), each against the same interpreter wi
 | Inception V1-224 | 7.4 ms | 180.5 ms | 24.4× | 81/83 | 53/53 | 1 |
 | Inception V3-299 | 34.5 ms | 669.3 ms | 19.4× | 130/132 | 90/94 | 16 |
 | SSD-MobileNetV2-COCO | 17.0 ms | 109.0 ms | 6.4× | 87/111 | 70/82 | 6 |
-| EfficientDet-Lite0-320 | 98.9 ms | 121.9 ms | 1.2× | 238/267 | 85/89 | 10 |
+| EfficientDet-Lite0-320 | 120.3 ms | 122.7 ms | 1.0× | 231/267 | 85/89 | 10 |
 
 Four of the five classifiers go out as a SINGLE hardware kick covering the whole partition. All five
 return the interpreter's own top-1 label; they differ from it on 0.2-1.3% of the output elements,
 which is this DPU's requant rather than a defect — it carries a 15-bit multiplier and rounds ties to
 even where TFLite carries 31 bits and rounds half away from zero, and the disagreement compounds down
-a chain because layer *n*+1 is fed the part's output rather than TFLite's. The two detectors run but
-are **not** validated: a detection list is NMS-ordered, so one count of drift reorders it, and
-scoring one is a mAP question (`tools/coco_map.py`).
+a chain because layer *n*+1 is fed the part's output rather than TFLite's.
+
+Both detectors score at **CPU parity**: mAP@[.5:.95] over 500 COCO val2017 images is 0.2617 against
+0.2631 for SSD-MobileNetV2 and 0.2809 against 0.2823 for EfficientDet-Lite0 — **-0.0014 each**
+(`tools/coco_map.py`). That is the comparison a detector admits, since its output list is NMS-ordered
+and one count of arithmetic drift reorders or drops a box, which makes an element-wise diff against
+the CPU meaningless.
+
+EfficientDet-Lite0 is the model with **per-axis** filter scales, and 36 of its 267 nodes stay on the
+CPU: 29 for op coverage and **7 because the part cannot express their per-channel gain**. A
+convolution runs as one hardware task carrying one output converter shift, so each output channel
+reaches its own scale through a 16-bit multiplier in its coefficient group; a channel whose scale
+sits below half its tile's base needs a multiplier under one, and the field's floor is one. The
+driver library answers that from the weights alone, with no device, and this delegate asks it while
+deciding what to claim — where a refusal costs one node the framework runs itself, rather than at
+Prepare, where it would fail the whole model. Refusing those 7 is what takes the model from mAP
+0.0000 to parity, and it costs 21 ms, because a node the delegate declines also splits the
+partition around it.
 
 The placement and linking rules — which tensors stay in cube layout, which producers write slices of
 one shared buffer, which runs of layers are one submit — are the driver library's `rocketgraph`
