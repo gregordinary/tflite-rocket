@@ -84,6 +84,7 @@ void rocket_pin_worker(int worker_idx);
 }
 #include "rocket_convert.h"   // NHWC<->NCHW + SAME/VALID pad + bias/act glue
 #include "rocket_ops.h"       // host ADD / POOL / CONCAT NHWC kernels (float + quant)
+#include "rocket_rk3576_net.h"// the RK3576 GRAPH path (planner-driven; see the header)
 
 namespace {
 
@@ -157,6 +158,14 @@ struct RocketOptions {
                                 // re-quantization-barrier rule (or mAP validation) before it can
                                 // default on. nchw_resident=1 opts in (validated on chains that
                                 // re-quantize before the output, e.g. a MobileNetV2 block).
+    bool rk3576_graph = true;   // on an RK3576, run a delegated partition as one PLANNED
+                                // GRAPH (rocket_rk3576_net.h) rather than as a sequence of
+                                // ops. It is not a tuning choice: the op entries and the
+                                // graph path are ~115 ms and 5.0 ms on the same
+                                // MobileNetV1-224, because residency, cube layout between
+                                // layers and the cross-layer kick are all properties of the
+                                // graph. rk3576=0 is the A/B arm, and on any other part
+                                // this flag does nothing.
 };
 
 // A 1x1 stride-1 conv we can hand to the matmul: just the matmul's HARD alignment
@@ -3564,9 +3573,76 @@ static TfLiteRegistration rocket_kernel_registration() {
     return r;
 }
 
+// ---- the RK3576 GRAPH kernel ---------------------------------------------------------
+// Same four callbacks over rocket_rk3576::Kernel, which runs a partition as one planned
+// network. A separate registration rather than a mode inside RocketKernel: the two share
+// no execution path — one claims ops and runs them, the other lowers a subgraph, packs
+// every layer's weights, plans the placement and linking, and submits runs of layers as
+// single hardware kicks — and the RK3588 path is shipped and validated.
+
+static void *rocket3576_kernel_init(TfLiteContext *context, const char *buffer,
+                                    size_t /*len*/) {
+    const auto *params = reinterpret_cast<const TfLiteDelegateParams *>(buffer);
+    if (!params || !params->delegate) return nullptr;
+    const auto *self = reinterpret_cast<const RocketDelegate *>(params->delegate->data_);
+    std::unique_ptr<rocket_rk3576::Kernel> kernel(
+        new (std::nothrow) rocket_rk3576::Kernel(self->opts.profile));
+    if (!kernel) return nullptr;
+    if (kernel->Init(context, params) != kTfLiteOk) return nullptr;
+    return kernel.release();
+}
+
+static void rocket3576_kernel_free(TfLiteContext * /*context*/, void *buffer) {
+    delete reinterpret_cast<rocket_rk3576::Kernel *>(buffer);
+}
+
+static TfLiteStatus rocket3576_kernel_prepare(TfLiteContext *context, TfLiteNode *node) {
+    auto *kernel = reinterpret_cast<rocket_rk3576::Kernel *>(node->user_data);
+    return kernel ? kernel->Prepare(context) : kTfLiteError;
+}
+
+static TfLiteStatus rocket3576_kernel_invoke(TfLiteContext *context, TfLiteNode *node) {
+    auto *kernel = reinterpret_cast<rocket_rk3576::Kernel *>(node->user_data);
+    return kernel ? kernel->Eval(context) : kTfLiteError;
+}
+
+static TfLiteRegistration rocket3576_kernel_registration() {
+    TfLiteRegistration r{};
+    r.init = rocket3576_kernel_init;
+    r.free = rocket3576_kernel_free;
+    r.prepare = rocket3576_kernel_prepare;
+    r.invoke = rocket3576_kernel_invoke;
+    r.builtin_code = kTfLiteBuiltinDelegate;
+    r.custom_name = "RocketDelegateRK3576";
+    return r;
+}
+
 // delegate Prepare: claim every supported node and replace the subset with our kernel.
 static TfLiteStatus rocket_delegate_prepare(TfLiteContext *context, TfLiteDelegate *delegate) {
     const auto *self = reinterpret_cast<const RocketDelegate *>(delegate->data_);
+
+    // THE PART DECIDES WHICH PATH RUNS, not an option. The RK3588 generators refuse on the
+    // RK3576 by construction and the RK3576 entries refuse on the RK3588, so claiming a
+    // node for the wrong one is not a slow answer but no answer at all.
+    if (self->opts.rk3576_graph && rocket_rk3576::is_rk3576()) {
+        std::vector<char> claimed;
+        std::vector<int> order;
+        if (!rocket_rk3576::build_claim(context, &claimed, &order)) return kTfLiteError;
+        std::vector<int> supported;
+        for (int n : order) if (claimed[n]) supported.push_back(n);
+        if (self->opts.profile)
+            fprintf(stderr, "[rocket/rk3576] claiming %zu of %zu nodes\n",
+                    supported.size(), order.size());
+        TfLiteIntArray *nodes = TfLiteIntArrayCreate((int)supported.size());
+        if (!nodes) return kTfLiteError;
+        for (size_t i = 0; i < supported.size(); i++) nodes->data[i] = supported[i];
+        const TfLiteRegistration kreg = rocket3576_kernel_registration();
+        const TfLiteStatus st =
+            context->ReplaceNodeSubsetsWithDelegateKernels(context, kreg, nodes, delegate);
+        TfLiteIntArrayFree(nodes);
+        return st;
+    }
+
     TfLiteIntArray *plan = nullptr;
     if (context->GetExecutionPlan(context, &plan) != kTfLiteOk) return kTfLiteError;
 
@@ -3639,6 +3715,7 @@ TfLiteDelegate *tflite_plugin_create_delegate(
         else if (k == "ew_npu")        opts.ew_npu        = (rocket_opt_long("ew_npu", v, 0) != 0);
         else if (k == "resize_npu")    opts.resize_npu    = (rocket_opt_long("resize_npu", v, 0) != 0);
         else if (k == "norm_npu")      opts.norm_npu      = (rocket_opt_long("norm_npu", v, 0) != 0);
+        else if (k == "rk3576")        opts.rk3576_graph  = (rocket_opt_long("rk3576", v, 1) != 0);
     }
     if (opts.nthreads < 1) opts.nthreads = 1;
     if (opts.nthreads > 8) opts.nthreads = 8;

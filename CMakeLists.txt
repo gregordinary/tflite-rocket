@@ -65,7 +65,12 @@ if(DEFINED TFLITE_DIR)
         ${TFLITE_DIR})                                  # tensorflow/lite/... C-API headers
     # tflite_plugin_create_delegate keeps default visibility (no -fvisibility=hidden) so
     # the external-delegate loader can dlsym it.
-    target_link_libraries(tflite_rocket PRIVATE rocketnpu::rocketnpu)
+    # rocketgraph is the RK3576 GRAPH PLANNER — the placement and linking rules that decide
+    # which tensors stay in the part's cube layout, which producers write slices of one
+    # buffer and which runs of layers go out as one hardware kick. It ships with the
+    # rocketnpu package rather than living here because a second copy of those rules would
+    # fork silently; see rocket_rk3576_net.h.
+    target_link_libraries(tflite_rocket PRIVATE rocketnpu::rocketgraph rocketnpu::rocketnpu)
     target_compile_options(tflite_rocket PRIVATE -Wall -Wextra)
 
     # Portability: internalize the glibc 2.38 __isoc23_strtol/fscanf symbols so the .so
