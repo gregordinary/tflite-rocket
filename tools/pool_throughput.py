@@ -20,9 +20,11 @@
 # This harness spawns P such processes against one representative submit-bound model and
 # reports aggregate inferences/sec and the speedup vs P=1.
 #
-# Run on RK3588 hardware (needs a device + tensorflow):
+# Run on RK3588 hardware (needs a device; the interpreter comes from tflite_runtime,
+# ai_edge_litert or tensorflow, whichever imports -- only GENERATING the default unit
+# model needs tensorflow, so pass --model to run on a board that has none):
 #   sudo modprobe rocket rocket_npu_clk_hz=600000000
-#   python3 pool_throughput.py /path/to/libtflite_rocket.so [--big 4,5,6,7] [--iters 200]
+#   python3 pool_throughput.py /path/to/libtflite_rocket.so [--model m.tflite] [--big 4,5,6,7] [--iters 200]
 
 import argparse, os, sys, time, multiprocessing as mp
 
@@ -37,6 +39,36 @@ def make_model(path):
     m = tf.keras.Model(x, y)
     with open(path, 'wb') as f: f.write(tf.lite.TFLiteConverter.from_keras_model(m).convert())
 
+def load_tflite():
+    """Returns (Interpreter, load_delegate). LiteRT is the maintained successor to
+    tflite_runtime and the only wheel on recent Python; full tensorflow is the last
+    resort, and is the only one of the three that can also BUILD the unit model."""
+    try:
+        from tflite_runtime.interpreter import Interpreter, load_delegate
+        return Interpreter, load_delegate
+    except ImportError:
+        pass
+    try:
+        from ai_edge_litert.interpreter import Interpreter, load_delegate
+        return Interpreter, load_delegate
+    except ImportError:
+        pass
+    import tensorflow as tf
+    return tf.lite.Interpreter, tf.lite.experimental.load_delegate
+
+
+def make_feed(detail, core):
+    """A dtype-correct input: a quantized detector takes uint8/int8, and feeding it
+    float32 raises rather than running."""
+    import numpy as np
+    dt = detail['dtype']
+    rng = np.random.default_rng(core)
+    if dt == np.float32:
+        return rng.standard_normal(detail['shape']).astype(np.float32)
+    info = np.iinfo(dt)
+    return rng.integers(info.min, info.max + 1, size=detail['shape'], dtype=dt)
+
+
 def worker(args):
     """One detection context, pinned to a single big core, running `iters` inferences."""
     so, model, core, iters = args
@@ -45,13 +77,12 @@ def worker(args):
         os.sched_setaffinity(0, {core})                   # and the process itself
     except OSError:
         pass
-    import numpy as np, tensorflow as tf
-    deleg = tf.lite.experimental.load_delegate(so, options={'nthreads': '1'})
-    it = tf.lite.Interpreter(model_path=model, experimental_delegates=[deleg])
+    Interpreter, load_delegate = load_tflite()
+    deleg = load_delegate(so, options={'nthreads': '1'})
+    it = Interpreter(model_path=model, experimental_delegates=[deleg])
     it.allocate_tensors()
     inp = it.get_input_details()[0]
-    x = np.random.default_rng(core).standard_normal(inp['shape']).astype(np.float32)
-    it.set_tensor(inp['index'], x)
+    it.set_tensor(inp['index'], make_feed(inp, core))
     it.invoke()                                           # warm (clock ride-up + first-run pack)
     t0 = time.perf_counter()
     for _ in range(iters):
@@ -68,7 +99,11 @@ def main():
     a = ap.parse_args()
     big = [int(c) for c in a.big.split(',')]
     if not os.path.exists(a.model):
-        make_model(a.model)
+        try:
+            make_model(a.model)
+        except ImportError:
+            sys.exit(f'{a.model} does not exist and building it needs tensorflow, which is '
+                     f'not importable here -- pass --model <an existing .tflite> instead.')
         print(f'wrote {a.model}')
     base = None
     print(f'P  aggregate_inf/s  speedup   per-ctx(min..max)')

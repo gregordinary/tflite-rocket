@@ -31,7 +31,16 @@ endif()
 # Prefer an installed rocketnpu CMake package (cmake --install of rocket-userspace, which
 # exports rocketnpu::rocketnpu); otherwise build it from a sibling checkout. Override
 # the source location with -DROCKETNPU_DIR=/path/to/rocket-userspace.
-find_package(rocketnpu QUIET CONFIG)
+#
+# An EXPLICIT -DROCKETNPU_DIR wins over an installed package. Otherwise a machine with a
+# stale /usr/local install silently builds the delegate against THAT driver while the
+# configure log names the source tree the user asked for -- and the resulting .so reports
+# on code that is not the code under test.
+if(DEFINED ROCKETNPU_DIR)
+    message(STATUS "tflite-rocket: ROCKETNPU_DIR set explicitly; ignoring any installed rocketnpu package")
+else()
+    find_package(rocketnpu QUIET CONFIG)
+endif()
 if(rocketnpu_FOUND)
     message(STATUS "tflite-rocket: using installed rocketnpu package")
 else()

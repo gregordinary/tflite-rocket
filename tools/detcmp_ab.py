@@ -11,10 +11,16 @@ try:
     from tflite_runtime.interpreter import Interpreter, load_delegate, OpResolverType
     NDR = OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
 except ImportError:
-    import tensorflow as tf
-    Interpreter = tf.lite.Interpreter
-    load_delegate = tf.lite.experimental.load_delegate
-    NDR = tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+    try:
+        # LiteRT, the maintained successor to tflite_runtime and the only wheel on
+        # recent Python; same interpreter + external-delegate + resolver API.
+        from ai_edge_litert.interpreter import Interpreter, load_delegate, OpResolverType
+        NDR = OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+    except ImportError:
+        import tensorflow as tf
+        Interpreter = tf.lite.Interpreter
+        load_delegate = tf.lite.experimental.load_delegate
+        NDR = tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
 
 model, img_path, deleg = sys.argv[1], sys.argv[2], sys.argv[3]
 

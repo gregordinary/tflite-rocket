@@ -160,7 +160,8 @@ dependency resolves via
 
 ### Recommended configuration
 
-For a detector (Frigate's regime), the two settings that matter:
+For a detector (Frigate's regime), the two settings that matter — plus one that is not a delegate
+option at all:
 
 - **`native_int8=1`** — run the int8/uint8 convs on the exact int8 datapath (the default in the Frigate
   `rocket.py` plugin). COCO mAP is CPU-parity (MobileDet 0.3321 vs 0.3318 [HW sweep]); `mm_int8=1`
@@ -172,6 +173,12 @@ For a detector (Frigate's regime), the two settings that matter:
   distinct A76 core via the `ROCKET_CPU_AFFINITY` env var: 3.20 → 9.55 detection_fps at P=1→4 (2.98×,
   live Frigate). `nthreads` (default 4) fans a single conv across the 3 NPU cores; the pool fans across
   streams — the pool is the larger lever.
+- **Keep the big cores off their floor.** The inference blocks while the NPU runs, so a load-sampling
+  CPU governor sees idle cores, parks them at `scaling_min_freq`, and the host cube gather then runs
+  at that floor. Measured on one MobileDet run: 199.7 ms with the cores pinned against 639.4 ms under
+  `ondemand` where the A76 floor is 408 MHz (1.27x where it is 1.2 GHz), while plain-CPU TFLite is
+  flat in both. Raise the floor for the cores the detector processes run on; `performance` everywhere
+  is not needed and pinning is required before any NPU-versus-CPU number is quoted.
 
 `ROCKET_PROF_POOL=1` (env, off by default, zero cost when unset) tallies the host `parallel_oh`
 fan-out — fan-out calls, threads spawned, and total wall in the fan-out regions — and prints one
@@ -220,7 +227,10 @@ this probe on a different detector before revisiting.
   one (the auto-affinity pins every 1-thread context's worker to big-core 0). Measured on the RK1
   (`tools/pool_throughput.py`, a 1×1-conv submit-bound unit, 600 MHz): **P=1→4 = 1.00× / 2.17× /
   3.11× / 3.56×** aggregate inferences/s — end-to-end through the delegate, matching the driver
-  gate's pool ceiling (`rocket-userspace/tests/ctx_pool_throughput.c`). The application glue ships in
+  gate's pool ceiling (`rocket-userspace/tests/ctx_pool_throughput.c`). A rate is not the whole
+  gate: several contexts share one NPU, so `tools/pool_hash.py` runs the same fan-out asserting
+  that every process's output hash equals the single-process reference (measured 3.51-3.61× at
+  P=4 on SSDLite-MobileDet, one hash throughout). The application glue ships in
   `frigate/`: **Frigate's `rocket.py` detector plugin** (one process per camera, `num_threads: 1`, the
   per-process affinity env) plus config and compose. Live-validated on the RK1 with a pool of
   `rocket0..rocket3` detectors, each pinned to a distinct A76, serving four SSD-MobileDet cameras

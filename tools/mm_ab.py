@@ -20,9 +20,17 @@ def load():
         from tflite_runtime.interpreter import Interpreter, load_delegate, OpResolverType
         return Interpreter, load_delegate, OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
     except ImportError:
-        import tensorflow as tf
-        return (tf.lite.Interpreter, tf.lite.experimental.load_delegate,
-                tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES)
+        pass
+    try:
+        # LiteRT, the maintained successor to tflite_runtime and the only wheel on
+        # recent Python; same interpreter + external-delegate + resolver API.
+        from ai_edge_litert.interpreter import Interpreter, load_delegate, OpResolverType
+        return Interpreter, load_delegate, OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
+    except ImportError:
+        pass
+    import tensorflow as tf
+    return (tf.lite.Interpreter, tf.lite.experimental.load_delegate,
+            tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES)
 
 def run(Interp, ndr, model, feeds, load_delegate=None, opts=None):
     dl = [load_delegate(opts["__so__"], options={k: v for k, v in opts.items() if k != "__so__"})] \

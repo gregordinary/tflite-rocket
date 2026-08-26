@@ -7,7 +7,10 @@ import sys
 try:
     from tflite_runtime.interpreter import Interpreter
 except ImportError:
-    from tensorflow.lite.python.interpreter import Interpreter
+    try:
+        from ai_edge_litert.interpreter import Interpreter
+    except ImportError:
+        from tensorflow.lite.python.interpreter import Interpreter
 
 def main(path):
     it = Interpreter(model_path=path); it.allocate_tensors()

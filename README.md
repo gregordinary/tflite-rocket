@@ -154,6 +154,14 @@ Throughput comes from running several detection contexts concurrently — one pr
 host-requant NEON vectorization, the multi-camera throughput recipe, and the op-coverage gaps are
 detailed in [API.md](API.md#host-side-work-and-remaining-gaps).
 
+**Do not leave the CPU cores free to park.** Because the inference is host cube-gather-bound and the
+process blocks while the NPU runs, a load-sampling CPU governor reads the cores as idle and drops
+them toward `scaling_min_freq` — and the host half of the next inference then runs at that floor.
+The same MobileDet run measures 199.7 ms with the big cores pinned and **639.4 ms** under `ondemand`
+on a board whose A76 floor is 408 MHz (1.27x rather than 3.2x where the floor is 1.2 GHz), while
+plain-CPU TFLite on the same board is flat at 183 ms in both. A deployment needs the floor raised,
+not `performance` everywhere; a benchmark needs the governor pinned before any number is quoted.
+
 ## Build
 
 **Prerequisites.** An RK3588 board on a mainline kernel carrying the `rocket` DRM-accel driver, with
@@ -205,11 +213,12 @@ Pass `-DTFLITE_ROCKET_PORTABLE_GLIBC=ON` to run the `.so` on an older-glibc targ
 [frigate/README.md](frigate/README.md), which uses it to deploy into the Frigate image.
 
 > **If the driver is installed** (`find_package(rocketnpu)` resolves to a `cmake --install`d package,
-> e.g. `/usr/local`), the delegate links that installed header/lib, not the source tree. So after any
-> change in `rocket-userspace/`, reinstall the driver before rebuilding the delegate:
-> `cd ../rocket-userspace && cmake --build build && sudo cmake --install build`, then `cmake --build
-> build` here. (`convert_test` uses the source headers directly, so it can pass while the delegate
-> `.so` still links a stale installed lib — don't be fooled.)
+> e.g. `/usr/local`), the delegate links that installed header/lib rather than a sibling source tree.
+> So after any change in `rocket-userspace/`, either reinstall the driver before rebuilding the
+> delegate — `cd ../rocket-userspace && cmake --build build && sudo cmake --install build`, then
+> `cmake --build build` here — or name the tree explicitly with `-DROCKETNPU_DIR=/path/to/it`, which
+> wins over the installed package. (`convert_test` uses the source headers directly, so it can pass
+> while the delegate `.so` still links a stale installed lib — don't be fooled.)
 
 **Gate the glue without TFLite.** `convert_test` links only the driver and runs the delegate's exact
 layout/pad/bias/activation path against an independent NHWC oracle — on the CPU oracle off-device
@@ -230,6 +239,30 @@ device-independent).
 The full external-delegate option reference (`native_int8` / `mm_int8` / `nthreads` / `aux_ops` / the
 `*_npu` routes / `nchw_resident` / …) and the `ROCKET_PROF_POOL` probe are in
 [delegate options](API.md#delegate-options).
+
+### On a vendor BSP kernel
+
+The delegate does not have to run on the mainline `rocket` driver. `librocketnpu` puts every kernel
+interaction behind one submit seam, and
+[`rknpu-submit`](https://github.com/gregordinary/rknpu-submit) implements that seam against the
+Rockchip BSP `rknpu` driver — the one a stock vendor image already ships. Building the delegate
+against it is three extra cache entries and no source change:
+
+```sh
+cmake -S . -B build -DTFLITE_DIR=/path/to/tflite-c-headers \
+      -DROCKETNPU_DIR=/path/to/rocket-userspace \
+      -DROCKETNPU_PROVIDER=external \
+      -DROCKETNPU_PROVIDER_LIB=/path/to/build-rknpu/librknpu-submit.a
+```
+
+The two paths are measured to agree. On one RK3588, from the same sources, clock-matched at
+600 MHz, an MD5 over every output tensor of SSDLite-MobileDet and EfficientDet-Lite0 is identical
+on the two drivers in the CPU, `native_int8=1` and `native_int8=0` arms, with every `*_npu` route
+enabled and on the `nchw_resident` path. `convert_test` and the six driver-level probes under
+`tests/` pass on both. Warm single-inference latency is within 2% (MobileDet 202.1 ms against
+197.9, EfficientDet-Lite0 299.6 against 293.6), on a workload host-bound enough that the two
+boards' own CPU ceilings account for it, and a four-process pool aggregates 3.51x against 3.61x
+with every process returning the single-process output hash.
 
 ## The rocket NPU stack
 
