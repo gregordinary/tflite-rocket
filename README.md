@@ -7,7 +7,7 @@ With the exception of prior work this may build on, tflite-rocket was developed 
 ## About tflite-rocket
 
 A TensorFlow Lite external delegate for Rockchip NPUs (validated on the RK3588) via the mainline
-`rocket` DRM-accel driver — the detection frontend of the stack. It offloads supported TFLite ops to
+`rocket` DRM-accel driver, and the detection frontend of the stack. It offloads supported TFLite ops to
 the NPU through the standalone `rocket-userspace` driver library; everything else falls back to the
 CPU, exactly like ggml's scheduler. Any TFLite-based application can load it at runtime and run an
 unmodified `.tflite` model; the motivating use case is real-time detection (for example, Frigate) on
@@ -25,10 +25,10 @@ the TensorFlow Lite runtime.
 Real `.tflite` detectors run on the NPU through this delegate, including native int8 and native uint8
 convolution. The delegate (`rocket_delegate.cpp`, a classic C `TfLiteDelegate`) partitions the graph
 and runs general `CONV_2D`, `DEPTHWISE_CONV_2D`, and the surrounding `ADD`/`POOL`/`CONCAT`/`RESHAPE`
-seams — float and int8/uint8 — so a whole MobileNet/SSD partition is NPU-resident. The 1×1 pointwise
+seams, float and int8/uint8, so a whole MobileNet/SSD partition is NPU-resident. The 1×1 pointwise
 fast path uses the resident prepacked matmul; the general / strided / stem / depthwise convs use the
 HW-validated `rocket_conv2d_fp16`. int8/uint8 has two paths: the default dequant↔fp16 boundary (an
-fp16 approximation) and the opt-in `native_int8=1` path — a real int8×int8→int32 conv with host
+fp16 approximation) and the opt-in `native_int8=1` path, a real int8xint8->int32 conv with host
 requant and exact int8/uint8 semantics. The complete op mapping, the quantization internals, the
 delegate-option reference, and the host-side/gaps analysis are in [API.md](API.md).
 
@@ -36,8 +36,8 @@ delegate-option reference, and the host-side/gaps analysis are in [API.md](API.m
 
 A TFLite external delegate.
 
-- TFLite loads an external delegate `.so` at runtime. The `.so` exports two C symbols —
-  `tflite_plugin_create_delegate` / `tflite_plugin_destroy_delegate` — and implements
+- TFLite loads an external delegate `.so` at runtime. The `.so` exports two C symbols,
+  `tflite_plugin_create_delegate` and `tflite_plugin_destroy_delegate`, and implements
   `tflite::SimpleDelegateInterface`. The runtime auto-partitions the graph: ops our
   `IsNodeSupportedByDelegate` accepts run on the NPU; the rest stay on CPU.
 - Another external delegate (Teflon) already targets this same driver; tflite-rocket is a separate
@@ -53,27 +53,27 @@ op-by-op table is in [API.md](API.md#tflite-op-mapping).
 
 ### Using it from an application
 
-Any TFLite-based application loads the delegate at runtime — in Python via
-`tflite.load_delegate(".../libtflite_rocket.so")`, or through the equivalent C external-delegate API
-— and runs an unmodified `.tflite` model. Nothing in the delegate is detector- or
+Any TFLite-based application loads the delegate at runtime, in Python via
+`tflite.load_delegate(".../libtflite_rocket.so")` or through the equivalent C external-delegate API,
+and runs an unmodified `.tflite` model. Nothing in the delegate is detector- or
 application-specific.
 
 Some applications need a thin adapter. Frigate, for example, compiles its detectors as Python plugins
 (it has no external-detector loader and ships an `rknn` detector but no `rocket` one), so shipping
-there is two pieces: the delegate `.so` (this project) plus a small `rocket.py` detector plugin —
-modeled on Frigate's own `cpu_tfl.py` — that loads a model with the delegate via
+there is two pieces: the delegate `.so` (this project) plus a small `rocket.py` detector plugin,
+modeled on Frigate's own `cpu_tfl.py`, that loads a model with the delegate via
 `tflite.load_delegate`. That plugin is the only application-specific piece; the delegate itself is
 generic. A complete Frigate deployment (the plugin, a Docker image, compose, and config) lives in
 [frigate/](frigate/), validated running SSDLite-MobileDet on the NPU inside Frigate.
 
-### The RK3576: a delegated partition is a planned GRAPH
+### The RK3576: a delegated partition is a planned graph
 
 The RK3576 carries the same NPU IP with a different register encoding, and on it the delegate takes a
 second path: a delegated partition is lowered, planned and run as one network rather than as a
 sequence of independent ops. That is not a tuning choice. On the same MobileNetV1-224 the op entries
 with transient weights cost ~115 ms, resident weights ~21 ms, keeping the tensors in the part's own
-cube layout between layers 10.4 ms, and submitting the whole run as ONE hardware kick 5.0 ms — and
-all three of those levers are properties of the graph, so none can be expressed one op at a time.
+cube layout between layers 10.4 ms, and submitting the whole run as one hardware kick 5.0 ms. All
+three of those levers are properties of the graph, so none can be expressed one op at a time.
 
 The path is selected from the detected part, not from an option (`rk3576=0` is the A/B arm). It
 claims `CONV_2D`, `DEPTHWISE_CONV_2D`, `AVERAGE_POOL_2D`, `MAX_POOL_2D`, `ADD`, `CONCATENATION`,
@@ -84,22 +84,22 @@ RK3576 (H96 MAX M9, kernel 7.1.6, 786 MHz), each against the same interpreter wi
 
 | model | delegate | CPU | | claimed | joins | kicks |
 |---|---:|---:|---:|---:|---:|---:|
-| MobileNetV1-224 | 5.2 ms | 71.7 ms | 13.9× | 29/31 | 28/28 | 1 |
-| MobileNetV2-224 | 6.8 ms | 45.3 ms | 6.6× | 64/66 | 63/63 | 1 |
-| ResNet-18-224 | 8.8 ms | 167.1 ms | 19.0× | 36/38 | 27/27 | 1 |
-| Inception V1-224 | 7.4 ms | 180.5 ms | 24.4× | 81/83 | 53/53 | 1 |
-| Inception V3-299 | 34.5 ms | 669.3 ms | 19.4× | 130/132 | 90/94 | 16 |
-| SSD-MobileNetV2-COCO | 17.0 ms | 109.0 ms | 6.4× | 87/111 | 70/82 | 6 |
-| EfficientDet-Lite0-320 | 120.3 ms | 122.7 ms | 1.0× | 231/267 | 85/89 | 10 |
+| MobileNetV1-224 | 5.2 ms | 71.7 ms | 13.9x | 29/31 | 28/28 | 1 |
+| MobileNetV2-224 | 6.8 ms | 45.3 ms | 6.6x | 64/66 | 63/63 | 1 |
+| ResNet-18-224 | 8.8 ms | 167.1 ms | 19.0x | 36/38 | 27/27 | 1 |
+| Inception V1-224 | 7.4 ms | 180.5 ms | 24.4x | 81/83 | 53/53 | 1 |
+| Inception V3-299 | 34.5 ms | 669.3 ms | 19.4x | 130/132 | 90/94 | 16 |
+| SSD-MobileNetV2-COCO | 17.0 ms | 109.0 ms | 6.4x | 87/111 | 70/82 | 6 |
+| EfficientDet-Lite0-320 | 120.3 ms | 122.7 ms | 1.0x | 231/267 | 85/89 | 10 |
 
-Four of the five classifiers go out as a SINGLE hardware kick covering the whole partition. All five
+Four of the five classifiers go out as a single hardware kick covering the whole partition. All five
 return the interpreter's own top-1 label; they differ from it on 0.2-1.3% of the output elements,
-which is this DPU's requant rather than a defect — it carries a 15-bit multiplier and rounds ties to
+which is this DPU's requant rather than a defect: it carries a 15-bit multiplier and rounds ties to
 even where TFLite carries 31 bits and rounds half away from zero, and the disagreement compounds down
 a chain because layer *n*+1 is fed the part's output rather than TFLite's.
 
 Both detectors score at **CPU parity**: mAP@[.5:.95] over 500 COCO val2017 images is 0.2617 against
-0.2631 for SSD-MobileNetV2 and 0.2809 against 0.2823 for EfficientDet-Lite0 — **-0.0014 each**
+0.2631 for SSD-MobileNetV2 and 0.2809 against 0.2823 for EfficientDet-Lite0, **-0.0014 each**
 (`tools/coco_map.py`). That is the comparison a detector admits, since its output list is NMS-ordered
 and one count of arithmetic drift reorders or drops a box, which makes an element-wise diff against
 the CPU meaningless.
@@ -110,29 +110,29 @@ convolution runs as one hardware task carrying one output converter shift, so ea
 reaches its own scale through a 16-bit multiplier in its coefficient group; a channel whose scale
 sits below half its tile's base needs a multiplier under one, and the field's floor is one. The
 driver library answers that from the weights alone, with no device, and this delegate asks it while
-deciding what to claim — where a refusal costs one node the framework runs itself, rather than at
+deciding what to claim, where a refusal costs one node the framework runs itself, rather than at
 Prepare, where it would fail the whole model. Refusing those 7 is what takes the model from mAP
 0.0000 to parity, and it costs 21 ms, because a node the delegate declines also splits the
 partition around it.
 
-The placement and linking rules — which tensors stay in cube layout, which producers write slices of
-one shared buffer, which runs of layers are one submit — are the driver library's `rocketgraph`
+The placement and linking rules (which tensors stay in cube layout, which producers write slices of
+one shared buffer, which runs of layers are one submit) are the driver library's `rocketgraph`
 component, not this project's, so a second frontend cannot fork them. What lives here is the TFLite
 lowering: the claim, the geometry (including TFLite's asymmetric `SAME` as an output extent, since
 the hardware derives the pad its last window consumes rather than taking a trailing one), the uint8
-→ int8 rebase, the weight transposes, the buffers and the boundary layout. See
+-> int8 rebase, the weight transposes, the buffers and the boundary layout. See
 [rocket_rk3576_net.h](rocket_rk3576_net.h) and `tools/rk3576_net_ab.py`.
 
 ## Performance
 
-Warm, RK3588 @ 600 MHz, `native_int8=1` (the exact-int8 path — opt-in for the delegate, and the
+Warm, RK3588 @ 600 MHz, `native_int8=1` (the exact-int8 path, opt-in for the delegate and the
 default in the Frigate `rocket.py` plugin). At a glance:
 
 | Metric | Result |
 |---|---|
 | COCO-val mAP@[.5:.95] | 0.3321 NPU vs 0.3318 CPU int8 (parity, 500 images) |
 | Warm single-stream latency | ~336 ms (host cube-gather-bound, not submit-bound) |
-| Multi-camera pool, P=1→4 | 3.20 → 9.55 detection_fps (2.98× at P=4, live Frigate) |
+| Multi-camera pool, P=1->4 | 3.20 -> 9.55 detection_fps (2.98x at P=4, live Frigate) |
 
 A single inference is host cube-scatter/gather-bound, so the NPU's value is throughput under a
 multi-camera pool (Frigate's regime), not single-stream latency. The levers behind the ~336 ms
@@ -140,23 +140,23 @@ single-stream figure (on MobileDet / MobileNetV2):
 
 - **Resident device state.** Packing weights once in `Prepare` and reusing a resident 5-BO conv pool
   (`rocket_conv_ctx`) across calls/tiles removes the dominant per-op cost. Warm MobileNetV2 block
-  ~28→12 ms (~3×), numerics bit-identical.
+  ~28->12 ms (~3x), numerics bit-identical.
 - **Multicore DIRECT conv** (`rocket_conv_pool` + `rocket_conv2d_int8_mt`) fans the conv's independent
-  OC/OH/OW tiles across the 3 NPU cores, bit-exact. Warm MobileDet 560→458 ms (1.21×).
-- **1×1 int8/uint8 → resident matmul** (`mm_int8`, default-on under `native_int8`): a 1×1 conv is a
-  matmul, so routing it to `rocket_matmul_int8_prepacked` is +8% warm (366→336 ms), bit-exact.
+  OC/OH/OW tiles across the 3 NPU cores, bit-exact. Warm MobileDet 560->458 ms (1.21x).
+- **1×1 int8/uint8 -> resident matmul** (`mm_int8`, default-on under `native_int8`): a 1×1 conv is a
+  matmul, so routing it to `rocket_matmul_int8_prepacked` is +8% warm (366->336 ms), bit-exact.
 - **COCO-val mAP: CPU parity.** MobileDet mAP@[.5:.95] = 0.3321 vs CPU 0.3318 (Δ +0.0002, 500 val
   images, `tools/coco_map.py`). The fp16-approx depthwise and the missing per-channel DW int8 cost
   ~0 mAP.
 
-Throughput comes from running several detection contexts concurrently — one process per stream
+Throughput comes from running several detection contexts concurrently, one process per stream
 (exactly how Frigate runs cameras), each pinned to a distinct A76 core via `ROCKET_CPU_AFFINITY`. The
 host-requant NEON vectorization, the multi-camera throughput recipe, and the op-coverage gaps are
 detailed in [API.md](API.md#host-side-work-and-remaining-gaps).
 
 **Do not leave the CPU cores free to park.** Because the inference is host cube-gather-bound and the
 process blocks while the NPU runs, a load-sampling CPU governor reads the cores as idle and drops
-them toward `scaling_min_freq` — and the host half of the next inference then runs at that floor.
+them toward `scaling_min_freq`, and the host half of the next inference then runs at that floor.
 The same MobileDet run measures 199.7 ms with the big cores pinned and **639.4 ms** under `ondemand`
 on a board whose A76 floor is 408 MHz (1.27x rather than 3.2x where the floor is 1.2 GHz), while
 plain-CPU TFLite on the same board is flat at 183 ms in both. A deployment needs the floor raised,
@@ -166,18 +166,18 @@ not `performance` everywhere; a benchmark needs the governor pinned before any n
 
 **Prerequisites.** An RK3588 board on a mainline kernel carrying the `rocket` DRM-accel driver, with
 `/dev/accel/accel0` present (`lsmod | grep rocket`). Build and install the sibling `rocket-userspace`
-driver first — `cd ../rocket-userspace && cmake -S . -B build && cmake --build build && sudo cmake
---install build` — since the delegate links it (see the reinstall note below). Bring your own
+driver first, since the delegate links it (see the reinstall note below):
+`cd ../rocket-userspace && cmake -S . -B build && cmake --build build && sudo cmake --install build`. Bring your own
 `.tflite` detector (e.g. `ssdlite_mobiledet_coco_qat_postprocess.tflite` from the Coral / MediaPipe
 model zoo). The NPU boots at 200 MHz and the delegate is correct there, but the figures above are at
-600 MHz — apply the `patches/rocket` clock patch and load the module with
+600 MHz: apply the `patches/rocket` clock patch and load the module with
 `rocket_npu_clk_hz=600000000`.
 
 The delegate is a classic C `TfLiteDelegate` (it does not use the C++ `SimpleDelegate` helper), so it
 builds against the TFLite C-API headers alone. The
 handful of TFLite symbols it references (`TfLiteIntArrayCreate`/`Free`) bind at `dlopen` from the host
 interpreter, exactly like Mesa's `libteflon.so`. Point `-DTFLITE_DIR` at any tree carrying
-`tensorflow/lite/core/c/{common,builtin_op_data}.h` + `tensorflow/lite/builtin_ops.h` — the set
+`tensorflow/lite/core/c/{common,builtin_op_data}.h` + `tensorflow/lite/builtin_ops.h`. The set
 Mesa's Teflon build ships at `<mesa>/include` works as-is, so no separate TFLite build is needed.
 Without one to hand, that whole set is four files and their transitive closure is themselves:
 
@@ -215,13 +215,13 @@ Pass `-DTFLITE_ROCKET_PORTABLE_GLIBC=ON` to run the `.so` on an older-glibc targ
 > **If the driver is installed** (`find_package(rocketnpu)` resolves to a `cmake --install`d package,
 > e.g. `/usr/local`), the delegate links that installed header/lib rather than a sibling source tree.
 > So after any change in `rocket-userspace/`, either reinstall the driver before rebuilding the
-> delegate — `cd ../rocket-userspace && cmake --build build && sudo cmake --install build`, then
-> `cmake --build build` here — or name the tree explicitly with `-DROCKETNPU_DIR=/path/to/it`, which
+> delegate (`cd ../rocket-userspace && cmake --build build && sudo cmake --install build`, then
+> `cmake --build build` here), or name the tree explicitly with `-DROCKETNPU_DIR=/path/to/it`, which
 > wins over the installed package. (`convert_test` uses the source headers directly, so it can pass
-> while the delegate `.so` still links a stale installed lib — don't be fooled.)
+> while the delegate `.so` still links a stale installed lib, so do not be fooled.)
 
 **Gate the glue without TFLite.** `convert_test` links only the driver and runs the delegate's exact
-layout/pad/bias/activation path against an independent NHWC oracle — on the CPU oracle off-device
+layout/pad/bias/activation path against an independent NHWC oracle: on the CPU oracle off-device
 (x86), or on the NPU when one is present (the hardware gate):
 
 ```sh
@@ -245,7 +245,7 @@ The full external-delegate option reference (`native_int8` / `mm_int8` / `nthrea
 The delegate does not have to run on the mainline `rocket` driver. `librocketnpu` puts every kernel
 interaction behind one submit seam, and
 [`rknpu-submit`](https://github.com/gregordinary/rknpu-submit) implements that seam against the
-Rockchip BSP `rknpu` driver — the one a stock vendor image already ships. Building the delegate
+Rockchip BSP `rknpu` driver, the one a stock vendor image already ships. Building the delegate
 against it is three extra cache entries and no source change:
 
 ```sh
@@ -266,14 +266,14 @@ with every process returning the single-process output hash.
 
 ## The rocket NPU stack
 
-This delegate is one frontend of an open source stack for Rockchip NPUs — three userspace projects
-plus a set of optional kernel patches:
+This delegate is one frontend of an open source stack for Rockchip NPUs: three userspace projects
+plus a set of optional kernel patches.
 
-- **[`rocket-userspace`](https://github.com/gregordinary/rocket-userspace)** (`librocketnpu`) — the userspace driver, matmul, and on-NPU op library. The
+- **[`rocket-userspace`](https://github.com/gregordinary/rocket-userspace)** (`librocketnpu`): the userspace driver, matmul, and on-NPU op library. The
   dependency; usable on its own.
-- **`tflite-rocket`** (this project) — a TFLite external delegate for detection models.
-- **[`ggml-rocket`](https://github.com/gregordinary/ggml-rocket)** — a ggml backend `.so` for `llama.cpp` / `whisper.cpp`, linking the same driver.
-- **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope) — optional out-of-tree kernel-module patches
+- **`tflite-rocket`** (this project): a TFLite external delegate for detection models.
+- **[`ggml-rocket`](https://github.com/gregordinary/ggml-rocket)**: a ggml backend `.so` for `llama.cpp` / `whisper.cpp`, linking the same driver.
+- **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope): optional out-of-tree kernel-module patches
   (clock / voltage / IOMMU). They raise the NPU clock from its 200 MHz boot default to 600 MHz; the
   performance figures here assume them.
 
