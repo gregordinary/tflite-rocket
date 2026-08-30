@@ -1,13 +1,16 @@
 # Frigate on the RK3588 NPU
 
 Run [Frigate](https://frigate.video) object detection on the Rockchip RK3588 NPU
-through the tflite-rocket delegate. The detector backbone runs on the NPU; the
+through the tflite-rocket delegate. The detector backbone runs on the NPU, and the
 rest of Frigate is unchanged.
 
-This directory is a complete deployment: a detector plugin, a Docker image that
-bakes it into stock Frigate, a compose file, and a config that brings the stack up
-on a looped sample clip so you can confirm detections before pointing a real camera
-at it.
+This directory is a complete deployment:
+
+- A detector plugin.
+- A Docker image that bakes it into stock Frigate.
+- A compose file.
+- A config that brings the stack up on a looped sample clip, so you can confirm
+  detections before pointing a real camera at it.
 
 ## Contents
 
@@ -26,12 +29,12 @@ Frigate compiles its detectors as Python plugins discovered at startup (it ships
 loads an unmodified SSDLite-MobileDet `.tflite` with the tflite-rocket external
 delegate via `tflite.load_delegate`, which runs the convolutional backbone on the
 NPU. The SSD `TFLite_Detection_PostProcess` op is a custom op and stays on the CPU,
-exactly as it does for Frigate's built-in `cpu`/`edgetpu` detectors, so the
-detection output and the labelmap are identical to those detectors.
+exactly as it does for Frigate's built-in `cpu` and `edgetpu` detectors. The detection
+output and the labelmap are therefore identical to those detectors.
 
-The delegate `.so` is self-contained: the driver is statically linked in and it
-talks to `/dev/accel/accel0` through raw ioctls, so the container needs only that
-one file plus the device node and the host `render` group. No libdrm, no extra
+The delegate `.so` is self-contained. The driver is statically linked in and it
+talks to `/dev/accel/accel0` through raw ioctls. The container therefore needs only
+that one file, plus the device node and the host `render` group. No libdrm, no extra
 runtime.
 
 **Model.** SSDLite-MobileDet (uint8, 320×320), Frigate's default CPU SSD model. On
@@ -40,10 +43,12 @@ over 500 val2017 images), so detections match what the `cpu` detector would prod
 
 ## Build and run
 
-The delegate links the driver, so it is built on the RK3588 host (a mainline kernel
-with the `rocket` accel driver and `/dev/accel/accel0`): the standard tflite-rocket
-build, see the top-level [README](../README.md). Build it on the host, not in a
-bookworm container: the C++ delegate needs `_Float16` as a real extended-float type,
+The delegate links the driver, so it is built on the RK3588 host, meaning a mainline
+kernel with the `rocket` accel driver and `/dev/accel/accel0`. That is the standard
+tflite-rocket build, in the top-level [README](../README.md).
+
+Build it on the host rather than in a bookworm container. The C++ delegate needs
+`_Float16` as a real extended-float type,
 which is GCC 13+ (the host toolchain), not bookworm's GCC 12.
 
 **One wrinkle: glibc.** The `.so` is copied into the Frigate image (Debian 12
@@ -77,11 +82,11 @@ docker compose logs -f frigate
 ```
 
 The shim (`libtflite_cshim.so`) provides the two TFLite C-API symbols the headers-only
-delegate binds at `dlopen`; the compose `LD_PRELOAD`s it (tflite_runtime loads its own
-C extension `RTLD_LOCAL`, so those symbols aren't otherwise visible to the delegate).
+delegate binds at `dlopen`. The compose `LD_PRELOAD`s it. tflite_runtime loads its own
+C extension `RTLD_LOCAL`, so those symbols are not otherwise visible to the delegate.
 
 The Frigate UI comes up on `https://<host>:8971`. On the System -> Detectors page
-the `rocket` detector reports its inference speed; the Debug view draws live
+the `rocket` detector reports its inference speed, and the Debug view draws live
 boxes on the sample clip.
 
 ## Detector configuration
@@ -114,7 +119,7 @@ model:
 
 ## Multi-camera throughput
 
-A single warm MobileDet inference is not video-rate on one stream; throughput comes
+A single warm MobileDet inference is not video-rate on one stream. Throughput comes
 from running several detectors concurrently, one per A76 core. Frigate runs one OS
 process per configured detector, so the plugin spreads them across the big cores by
 pinning each to a distinct core:
@@ -127,29 +132,39 @@ detectors:
   rocket3: { type: rocket, num_threads: 1, device: "7" }
 ```
 
-Measured live on the RK3588 (600 MHz, NPU IRQs pinned to the big cores) with a pool of
-`rocket0..rocket3` detectors serving four cameras: aggregate `detection_fps` scales
-P=1->4 = 1.00x / 1.88x / 2.50x / 2.98x (3.20 / 6.00 / 8.00 / 9.55 inferences/s), each
-detector landing on its own A76. The four big cores run ~73 % busy while the A55s handle
-video decode. A delegate-level submit-bound unit (`../tools/pool_throughput.py`) scales further
-(1.00x / 2.17x / 3.11x / 3.56x); the live pool tapers below that ceiling because a real
-MobileDet inference is host cube-scatter/gather-bound, not submit-bound, so per-inference latency
-rises (338->424 ms) as the four contexts contend for DRAM bandwidth. For the best result pin the
+Measured live on the RK3588 at 600 MHz, with NPU IRQs pinned to the big cores and a
+pool of `rocket0..rocket3` detectors serving four cameras:
+
+| Detectors | Aggregate `detection_fps` | Scaling |
+|---:|---:|---:|
+| 1 | 3.20 | 1.00x |
+| 2 | 6.00 | 1.88x |
+| 3 | 8.00 | 2.50x |
+| 4 | 9.55 | 2.98x |
+
+Each detector lands on its own A76. The four big cores run ~73 % busy while the A55s
+handle video decode.
+
+A delegate-level submit-bound unit (`../tools/pool_throughput.py`) scales further, to
+1.00x / 2.17x / 3.11x / 3.56x. The live pool tapers below that ceiling, because a real
+MobileDet inference is host cube-scatter-and-gather-bound rather than submit-bound.
+Per-inference latency therefore rises from 338 to 424 ms as the four contexts contend
+for DRAM bandwidth. For the best result pin the
 NPU IRQs to the big cores (`tools/npu_set_irq_affinity.sh throughput` in the driver repo).
 Frigate's System-page `inference_speed` ~250 ms is its own per-invoke timer, a narrower span
 than the ~336-338 ms full single-stream inference measured here.
 
 ## Using a real camera
 
-This deployment runs unchanged against live RTSP cameras; only the `cameras` block
-changes. The rocket detector has been run end to end on live cameras, detecting `person`
-and `car` on the NPU at the same `inference_speed ~250 ms` as the sample clip.
+This deployment runs unchanged against live RTSP cameras, and only the `cameras` block
+changes. The rocket detector has been run end to end on live cameras. It detects
+`person` and `car` on the NPU at the same `inference_speed ~250 ms` as the sample clip.
 
 Replace the sample `cameras` block (and drop its `motion:` override, since a real camera
 calibrates on its own still periods) with your camera, restreamed through go2rtc. The
-RK3588's hardware video decoder (`preset-rkmpp`) keeps the CPU free for detection, but
-it lives in the `-rk` image, so build with `--build-arg FRIGATE_VERSION=0.17.2-rk` to use
-it, or drop the `hwaccel_args` line for software decode on the standard image:
+RK3588's hardware video decoder (`preset-rkmpp`) keeps the CPU free for detection, and
+it lives in the `-rk` image. So build with `--build-arg FRIGATE_VERSION=0.17.2-rk` to
+use it, or drop the `hwaccel_args` line for software decode on the standard image:
 
 ```yaml
 go2rtc:
@@ -178,7 +193,7 @@ cameras:
   `crw-rw---- root render`, so the container process needs that group.
 - **Detections run but the System page shows the inference on CPU / very slow.** The
   default TFLite delegate (XNNPACK) claimed the convs before the rocket delegate. The
-  plugin guards against this with `BUILTIN_WITHOUT_DEFAULT_DELEGATES`; if you adapted
+  plugin guards against this with `BUILTIN_WITHOUT_DEFAULT_DELEGATES`. If you adapted
   it, keep that resolver.
 - **`version 'GLIBC_2.38' not found` when the delegate loads.** The `.so` was built on
   a host newer than the Frigate image (Debian 12 bookworm). Rebuild it with
@@ -187,28 +202,41 @@ cameras:
 - **`undefined symbol: TfLiteIntArrayCreate` when the delegate loads.** The cshim isn't
   preloaded. Confirm `libtflite_cshim.so` is in the image and `LD_PRELOAD` points to it
   (the compose sets this).
-- **No detections on the sample clip (`detection_fps` stays 0).** Frigate's motion
-  detector starts *calibrating* and ignores all motion until motion falls below ~5% of
-  the frame; a clip that moves continuously (a pan, or an object always on screen) never
-  finishes calibrating, so the detector never runs, not even Frigate's own CPU detector. The
-  clip needs a few still seconds first, then movement (what `make-sample-clip.sh`
-  produces). A real camera gets still periods naturally. Check progress with
-  `docker exec frigate curl -s localhost:5000/api/stats` (the `rocket` detector's
-  `inference_speed` is ~250 ms when it's running on the NPU).
-- **A live camera runs the detector but logs no events for long stretches.** Frigate only
-  runs detection on motion regions and only creates events for the object types in the
-  camera's `track` list. On a quiet outdoor scene, swaying foliage is often the only
-  motion, so the detector fires on those regions and finds nothing trackable, and the System
-  page shows a live `inference_speed` while `detection_fps` and events stay near zero. That
-  is motion and scene, not a detector fault (confirm the NPU path with the sample clip,
-  which has a scripted person). Two practical points: the SSD-MobileDet model runs at
-  320×320, so a distant or small object may not clear the score threshold; frame the
-  camera so objects of interest are a reasonable fraction of the view; and a stationary
-  object the model misreads as a non-tracked class (a white wall as `boat`, a window as
-  `clock`) is correctly filtered out by the `track` list, so it never becomes an event.
-- **First inference is slow.** The NPU clock parks at idle; the first run reads low.
+- **First inference is slow.** The NPU clock parks at idle, so the first run reads low.
   Steady-state is reached after a few inferences.
-- **The admin password / database resets on `docker compose down`.** The compose mounts
-  only `config.yml`, so Frigate's `/config` (its DB, auth, `model_cache`) lives inside the
-  container and is lost on recreate (a new one-time admin password prints on each start).
-  To persist it, mount a host directory to `/config` and keep `config.yml` inside it.
+- **The admin password or database resets on `docker compose down`.** The compose mounts
+  only `config.yml`. Frigate's `/config` holds its DB, auth and `model_cache`. That lives
+  inside the container and is lost on recreate, and a new one-time admin password prints
+  on each start. To persist it, mount a host directory to `/config` and keep `config.yml`
+  inside it.
+
+### No detections on the sample clip, and `detection_fps` stays 0
+
+Frigate's motion detector starts *calibrating* and ignores all motion until motion falls
+below ~5% of the frame. A clip that moves continuously never finishes calibrating, such as
+a pan or an object always on screen. The detector then never runs, not even Frigate's own
+CPU detector.
+
+The clip needs a few still seconds first, then movement, which is what
+`make-sample-clip.sh` produces. A real camera gets still periods naturally.
+
+Check progress with `docker exec frigate curl -s localhost:5000/api/stats`. The `rocket`
+detector's `inference_speed` is ~250 ms when it is running on the NPU.
+
+### A live camera runs the detector but logs no events for long stretches
+
+Frigate only runs detection on motion regions, and only creates events for the object
+types in the camera's `track` list. On a quiet outdoor scene, swaying foliage is often the
+only motion. The detector fires on those regions and finds nothing trackable, so the
+System page shows a live `inference_speed` while `detection_fps` and events stay near
+zero.
+
+That is motion and scene rather than a detector fault. The sample clip confirms the NPU
+path, because it has a scripted person. Two practical points follow:
+
+- The SSD-MobileDet model runs at 320×320, so a distant or small object can fail to clear
+  the score threshold. Frame the camera so objects of interest are a reasonable fraction
+  of the view.
+- A stationary object the model misreads as a non-tracked class is correctly filtered out
+  by the `track` list, so it never becomes an event. A white wall reads as `boat`, and a
+  window as `clock`.
