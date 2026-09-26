@@ -28,6 +28,8 @@ import argparse
 import time
 import numpy as np
 
+import delegate_counts
+
 
 def parse_options(pairs, parser):
     """Parse repeated --option k=v entries into a dict, erroring cleanly on a
@@ -90,6 +92,10 @@ def run(Interpreter, model, delegates, feeds, ndr, iters=1):
     # weights are packed in Prepare (before the first invoke), but the conv BO pool only
     # grows on the first invoke, so the per-op profile is steady-state from invoke #2 on.
     # Re-running the script does NOT warm anything (a fresh interpreter/delegate per run).
+    # The FIRST invoke's outputs are the ones returned and scored. Every invoke reads the same
+    # input, so a later one that wrote nothing would repeat an earlier answer; the later ones
+    # are only held to the first, and a change is reported.
+    first, n_changed = None, 0
     for it in range(max(1, iters)):
         if iters > 1:
             tag = "WARM" if it == iters - 1 else "cold" if it == 0 else "..."
@@ -99,7 +105,14 @@ def run(Interpreter, model, delegates, feeds, ndr, iters=1):
         if iters > 1:
             print(f"--- invoke {it + 1}/{iters}: {(time.perf_counter() - t0) * 1e3:.3f} ms wall ---",
                   flush=True)
-    return [interp.get_tensor(d["index"]).copy() for d in outs]
+        got = [interp.get_tensor(d["index"]).copy() for d in outs]
+        if first is None:
+            first = got
+        elif any(not np.array_equal(a, b) for a, b in zip(first, got)):
+            n_changed += 1
+    if iters > 1:
+        print(f"invokes returning anything but the first's answer: {n_changed} of {iters - 1}")
+    return first
 
 def main():
     ap = argparse.ArgumentParser()
@@ -126,15 +139,18 @@ def main():
     rng = np.random.default_rng(0)
     feeds = {d["index"]: make_input(d, rng) for d in base.get_input_details()}
 
-    delegates = None
+    delegates, c0 = None, None
     if args.delegate:
         opts = parse_options(args.option, ap)
         delegates = [load_delegate(args.delegate, options=opts)]
         print(f"loaded delegate {args.delegate} options={opts}")
+        c0 = delegate_counts.read(args.delegate)
 
     got = run(Interpreter, args.model, delegates, feeds, ndr, iters=args.iters)
     print(f"ran {args.model}: {len(got)} output(s); "
           f"shapes {[o.shape for o in got]} dtypes {[o.dtype for o in got]}")
+    if args.delegate:
+        delegate_counts.check(c0, delegate_counts.read(args.delegate))
 
     if args.save:
         np.savez(args.save, **{f"out{i}": o for i, o in enumerate(got)})

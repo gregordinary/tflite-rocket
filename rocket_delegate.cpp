@@ -84,6 +84,17 @@ void rocket_pin_worker(int worker_idx);
 }
 #include "rocket_convert.h"   // NHWC<->NCHW + SAME/VALID pad + bias/act glue
 #include "rocket_ops.h"       // host ADD / POOL / CONCAT NHWC kernels (float + quant)
+
+// What the delegate claimed, and where each claimed op ran, process-wide, for a harness to
+// assert rather than infer. Without a device the RK3588 path computes every conv on the
+// driver's CPU oracle, close enough to TFLite's arithmetic to pass a comparison, so outputs
+// alone cannot tell a run on the NPU from none. `ops_npu` counts, per invoke, the claimed ops
+// dispatched to an NPU route with a device open; `ops_host` the rest. rocket_delegate_counts()
+// reads all three, and they accumulate over every delegate instance in the process.
+static std::atomic<long> g_rocket_nodes_claimed{0};
+static std::atomic<long> g_rocket_ops_npu{0};
+static std::atomic<long> g_rocket_ops_host{0};
+
 #include "rocket_rk3576_net.h"// the RK3576 GRAPH path (planner-driven; see the header)
 
 namespace {
@@ -573,8 +584,8 @@ static bool analyze_conv(const TfLiteRegistration *reg, const TfLiteNode *node,
                 for (int oc = 0; oc < OC; oc++) if (wz[oc] != 128) { sym128 = false; break; }
                 out->needs_boxsum = !sym128;
             }
-            // DEPTHWISE native (int8-out on-chip requant): PER-TENSOR quant only (Teflon's
-            // constraint; per-channel DW needs BS_MUL, stays on fp16) and a SYMMETRIC pad
+            // DEPTHWISE native (int8-out on-chip requant): PER-TENSOR quant only (the on-chip
+            // requant is one OUT_CVT scale; per-channel DW needs BS_MUL, stays on fp16) and a SYMMETRIC pad
             // (the runtime uses the CNA's symmetric HW pad — the validated config; an
             // asymmetric SAME pad falls back to fp16). w_zp==0 (symmetric weights).
             bool w_per_tensor = false;
@@ -2159,10 +2170,10 @@ public:
             // visible — the success-only timing print below can't name the op that died.
             if (opts_.profile) {
                 if (n.kind == NodeKind::Conv)
-                    fprintf(stderr, "[rocket] op %d: %s K=%dx%d IC=%d OC=%d s=%dx%d %s ...\n",
+                    fprintf(stderr, "[rocket] op %d: %s K=%dx%d IC=%d OC=%d s=%dx%d %s route=%s ...\n",
                             op_i, n.conv.depthwise ? "dwconv" : "conv",
                             n.conv.KH, n.conv.KW, n.conv.IC, n.conv.OC, n.conv.sy, n.conv.sx,
-                            n.conv.is_quant ? "quant" : "float");
+                            n.conv.is_quant ? "quant" : "float", conv_route_name(n.conv));
                 else
                     fprintf(stderr, "[rocket] op %d: %s %s ...\n", op_i, node_op_name(n),
                             node_loc_tag(n));
@@ -2202,6 +2213,11 @@ public:
                             ? (n.conv.depthwise ? "dwconv" : "conv") : node_op_name(n));
                 return st;
             }
+            // A conv reaches the CPU oracle only when no device opened; every other op runs
+            // where its location tag says.
+            const bool on_npu = (n.kind == NodeKind::Conv && fd_ >= 0) ||
+                                strncmp(node_loc_tag(n), "(npu", 4) == 0;
+            (on_npu ? g_rocket_ops_npu : g_rocket_ops_host)++;
             op_i++;
             if (opts_.profile) {
                 const double ms = std::chrono::duration<double, std::milli>(
@@ -2266,6 +2282,15 @@ private:
         case NodeKind::Split:   return "split";
         }
         return "?";
+    }
+
+    // Which conv route Eval takes, for the profile line: the native int8 depthwise, the native
+    // int8 or uint8 direct conv, or the fp16 conv (float, or quant through dequant and requant).
+    static const char *conv_route_name(const ConvNode &c) {
+        if (c.native_dw) return "native-dw-int8";
+        if (c.native)    return "native-int8";
+        if (c.native_u8) return "native-uint8";
+        return "fp16";
     }
 
     // Profile label that distinguishes the binary ops sharing NodeKind::Add.
@@ -2462,8 +2487,8 @@ private:
         }
 
         // NATIVE int8 DEPTHWISE (int8-out on-chip requant): raw int8 filter
-        // [C][KH][KW] + the raw TFLite int32 bias (the driver folds Mesa's zero-point
-        // correction itself). Per-tensor quant; OC==IC==C.
+        // [C][KH][KW] + the raw TFLite int32 bias (the driver folds the input zero point
+        // itself). Per-tensor quant; OC==IC==C.
         if (c.native_dw) {
             c.w_i8.resize((size_t)c.OC * c.KH * c.KW);
             rocket_dw_filter_i8_to_chw((const signed char *)flt.data.data, c.w_i8.data(),
@@ -2707,8 +2732,9 @@ private:
 
         // --- NATIVE int8 DEPTHWISE (int8-out on-chip requant). Per-tensor quant,
         //     symmetric pad (validated config: the CNA's symmetric HW pad). Plain int8
-        //     transpose in/out; the runtime does the uint8-domain centering + on-chip
-        //     requant + the zero-point bias fold. Bit-exact to Teflon ground truth. ---
+        //     transpose in/out; the runtime does the input zero-point bias fold and the
+        //     on-chip requant. TFLite's accumulator exactly, its output within one at a
+        //     rounding boundary. ---
         if (c.native_dw) {
             const signed char *in_q  = (const signed char *)in.data.data;
             signed char       *out_q = (signed char *)outp.data.data;
@@ -3633,6 +3659,7 @@ static TfLiteStatus rocket_delegate_prepare(TfLiteContext *context, TfLiteDelega
         if (self->opts.profile)
             fprintf(stderr, "[rocket/rk3576] claiming %zu of %zu nodes\n",
                     supported.size(), order.size());
+        g_rocket_nodes_claimed += (long)supported.size();
         TfLiteIntArray *nodes = TfLiteIntArrayCreate((int)supported.size());
         if (!nodes) return kTfLiteError;
         for (size_t i = 0; i < supported.size(); i++) nodes->data[i] = supported[i];
@@ -3657,6 +3684,7 @@ static TfLiteStatus rocket_delegate_prepare(TfLiteContext *context, TfLiteDelega
         if (analyze_node(reg, node, context, self->opts, nullptr))
             supported.push_back(node_index);
     }
+    g_rocket_nodes_claimed += (long)supported.size();
 
     TfLiteIntArray *nodes = TfLiteIntArrayCreate((int)supported.size());
     if (!nodes) return kTfLiteError;
@@ -3732,6 +3760,15 @@ TfLiteDelegate *tflite_plugin_create_delegate(
 void tflite_plugin_destroy_delegate(TfLiteDelegate *delegate) {
     if (!delegate) return;
     delete reinterpret_cast<RocketDelegate *>(delegate->data_);
+}
+
+// The process-wide counts described at their definition. Any pointer may be null. A harness
+// that loaded this library as a delegate reaches the same instance through ctypes.CDLL on the
+// same path, and reads the counts before and after the run it scores.
+void rocket_delegate_counts(long *nodes_claimed, long *ops_npu, long *ops_host) {
+    if (nodes_claimed) *nodes_claimed = g_rocket_nodes_claimed.load();
+    if (ops_npu)       *ops_npu       = g_rocket_ops_npu.load();
+    if (ops_host)      *ops_host      = g_rocket_ops_host.load();
 }
 
 }  // extern "C"

@@ -12,7 +12,7 @@ and this is the reference.
 | `CONV_2D`, 1×1, stride 1 (**pointwise**), matmul-aligned | **the matmul** (`rocket_matmul_fp16_mt`, multicore) | wired |
 | `CONV_2D`, KxK / stride / `SAME`\|`VALID` pad / dilation (float) | fp16 conv (`rocket_conv2d_fp16`) | wired |
 | `DEPTHWISE_CONV_2D` (depth_multiplier 1, float + int8/uint8) | native depthwise conv (`rocket_conv2d_fp16` `depthwise=1`, G=32), **HW-validated bit-exact** | wired |
-| `CONV_2D`/`DEPTHWISE_CONV_2D`, **signed int8** (`native_int8=1`) | **NATIVE int8**: direct int8xint8->int32 (`rocket_conv2d_int8`, **multicore `_mt`**) + host per-axis requant; per-tensor DW int8-out on-chip requant (`rocket_conv2d_dw_int8`). **Exact int8**, SSD head bit-identical to CPU TFLite | wired (`native_int8`) |
+| `CONV_2D`/`DEPTHWISE_CONV_2D`, **signed int8** (`native_int8=1`) | **NATIVE int8**: direct int8xint8->int32 (`rocket_conv2d_int8`, **multicore `_mt`**) + host per-axis requant; per-tensor DW int8-out on-chip requant (`rocket_conv2d_dw_int8`). The direct convs are **exact int8** (SSD head bit-identical to CPU TFLite); the DW's on-chip requant is within one of TFLite at a rounding boundary | wired (`native_int8`) |
 | `CONV_2D` **1×1** int8/uint8 (`native_int8=1`, `mm_int8` default-on) | **resident int8 matmul** (`rocket_matmul_int8_prepacked`, a 1×1 *is* a matmul), K/N pad %32 and M%4 gate; falls back to the conv otherwise. Bit-exact + **nt-deterministic**. +8% warm | wired (`mm_int8`) |
 | `CONV_2D` **uint8** DIRECT (`native_int8=1`) | **NATIVE uint8**: recenter to int8 (`x=in_q−128`, `y=w_q−128`), reuse `rocket_conv2d_int8` (**multicore `_mt`**), fold the centering into `eff_bias` + a per-output-pixel box-sum (`rocket_in_window_sum_i8`, **NEON-vectorized**, **separable** for KW>1, skipped when w_zp==128). **Exact uint8**, all 66 MobileDet convs native, scores ~35-40% lower error vs CPU than fp16 | wired (`native_int8`) |
 | `CONV_2D`, int8/uint8 quantized (default) | dequant↔fp16 boundary, reuses the fp16 conv (uint8 DEPTHWISE / per-channel DW / asym-pad DW always) | wired |
@@ -103,9 +103,10 @@ This runs end-to-end and is HW-validated behind the default-off `native_int8` op
   the bias). It is a **real int8 accumulate, so an SSD head is BIT-IDENTICAL to CPU TFLite**
   at `max|delegate−CPU|=0`, and a MobileNetV2 block's mean deviation halves.
 - **DEPTHWISE** = int8-OUT with **on-chip requant** (`gen_conv2d_dw_int8` + `int8_out=1` ->
-  `rocket_conv2d_dw_int8` runtime: uint8-centered cubes plus the Mesa zero-point bias fold).
-  **per-tensor** only, and **bit-exact against Teflon ground truth** (`replay_dw_mesa` and
-  `conv_dw_int8_runtime`, delegate `max|delegate−Teflon|=0`).
+  `rocket_conv2d_dw_int8` runtime: raw int8 cubes with the input zero point folded into the
+  bias). **Per-tensor** quant with symmetric weights. Its accumulator is TFLite's exactly and
+  its requant is the DPU's. So an output can differ from CPU TFLite by one at a rounding
+  boundary, on 11 of 4096 outputs of one real model layer (`conv_dw_int8_runtime`).
 - **UINT8 DIRECT** = the same `rocket_conv2d_int8` runtime fed RE-CENTERED bytes,
   `x=in_q−128` and `y=w_q−128`, both always in [−128,127]. The per-OC centering constants
   `α·Wy + N·α·β`, where α=128−in_zp and β=128−w_zp, fold into `eff_bias`. The
@@ -122,12 +123,15 @@ This runs end-to-end and is HW-validated behind the default-off `native_int8` op
 **Run it with `--option native_int8=1`.** Signed-int8 symmetric-weight convs and uint8
 DIRECT convs at any weight zp take the native path. **uint8 DEPTHWISE, per-channel
 depthwise, and asymmetric-pad depthwise stay on the dequant↔fp16 boundary.** Per-channel
-DW on-chip requant needs the BS_MUL per-OC multiply path. uint8 DW native would match Teflon
-rather than CPU TFLite, a perf play with an accuracy caveat, and it is not wired.
+DW on-chip requant needs the BS_MUL per-OC multiply path. uint8 DW native is not wired:
+real uint8 depthwise weights carry an asymmetric zero point, and the NPU entry takes
+symmetric weights only.
 
-The oracle subtlety is that DIRECT int32-raw, both int8 and uint8, is a real accumulate and
-matches CPU TFLite. DW int8-OUT replicates Teflon's on-chip requant, so its oracle is
-Teflon, which itself differs from CPU TFLite by <=143.
+The oracle is CPU TFLite for every native path. DIRECT int32-raw, both int8 and uint8, is a
+real accumulate and matches it exactly. DW int8-OUT requantizes on the chip, so it matches
+TFLite's accumulator exactly and its output to within one. A Teflon capture is not an oracle
+for it. Mesa's rocket driver is a uint8 driver, and its output for an int8 model differs
+from CPU TFLite by up to 162.
 
 ### fp16-NCHW resident inter-op buffers (`nchw_resident`, opt-in)
 
@@ -170,7 +174,7 @@ The delegate reads these external-delegate options:
 | `nthreads` | 4 | Worker fan-out across the 3 NPU cores. It sizes **both** the 1×1 matmul fan-out **and** the native int8/uint8 DIRECT conv worker pool `rocket_conv_pool` |
 | `min_macs` | 0 | Minimum `OC*OH*OW*IC*KH*KW` to offload. 0 offloads every supported conv |
 | `aux_ops` | 1 | Claim the host elementwise, pooling, activation and shape ops. Set 0 to restrict the delegate to conv only |
-| `profile` | 0 | Per-op timing to stderr, including the `breakdown in/conv/out` sub-step split and the resident set |
+| `profile` | 0 | Per-op timing to stderr, including the `breakdown in/conv/out` sub-step split, the resident set, and each conv's route (`native-dw-int8`, `native-int8`, `native-uint8` or `fp16`) |
 | `nchw_resident` | 0 | Keep conv-to-conv intermediates in fp16-NCHW between ops, skipping the per-boundary transpose and the int8 requant and dequant. Opt-in, and Quantization above has the detail |
 
 `aux_ops` claims this set: `ADD`, `MAXIMUM`, `MINIMUM`, pool, concat, reshape, the
@@ -194,6 +198,23 @@ fusion:
 The driver dependency resolves via `find_package(rocketnpu)` if installed, else from a
 sibling `rocket-userspace` checkout. Override with
 `-DROCKETNPU_DIR=/path/to/rocket-userspace`.
+
+### Whether the delegate ran
+
+Without a device the delegate still claims its nodes, and every conv then runs on the driver's
+CPU oracle. That output lands close enough to TFLite's to pass a comparison, so the outputs alone
+cannot say whether the NPU ran. The delegate therefore exports three process-wide counts:
+
+```c
+void rocket_delegate_counts(long *nodes_claimed, long *ops_npu, long *ops_host);
+```
+
+`nodes_claimed` is the nodes the delegate took at Prepare. Per invoke, `ops_npu` counts the claimed
+ops dispatched to an NPU route with a device open, and `ops_host` the rest. A null pointer is
+skipped, and the counts accumulate over every delegate instance in the process. From Python,
+`ctypes.CDLL` on the path the delegate was loaded from reaches the same library. A harness reads
+the counts before and after the run it scores. `tools/delegate_counts.py` does that, and
+`coco_map.py`, `rk3576_net_ab.py`, `run_delegate.py` and `dw_native_e2e.py` all use it.
 
 ### Recommended configuration
 

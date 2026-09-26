@@ -479,7 +479,7 @@ static inline void rocket_in_i8_to_nchw_pad(
 
 /* Depthwise int8 filter TFLite [1][KH][KW][C] -> driver [C][KH][KW], kept int8 (raw
  * w_q). The native int8-out DW path (rocket_conv2d_dw_int8) does its own (C/G,KH,KW,G)
- * cube scatter + uint8-domain centering from this. Per-TENSOR quant only. Packed ONCE. */
+ * cube scatter from this. Per-TENSOR quant only. Packed ONCE. */
 static inline void rocket_dw_filter_i8_to_chw(
         const signed char *src, int8_t *dst, int C, int KH, int KW)
 {

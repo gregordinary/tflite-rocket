@@ -21,6 +21,10 @@
  *
  * Build (x86, no cmake): see the run recipe in the tflite-rocket README — gcc the C
  * driver sources, g++ this, link with -lm.
+ *
+ * Exit status: 0 PASS, 1 FAIL, and 2 SKIP on an aarch64 host where rocket_open() fails. There
+ * the CPU-oracle half still runs and must pass, but the device half, the reason the test runs
+ * on the target, did not. A listed case that runs nothing counts as a failure.
  */
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +40,16 @@ extern "C" {
 }
 #include "rocket_convert.h"
 #include "rocket_ops.h"
+
+/* A listed case that runs nothing. Every case in the tables below is meant to run, so a skip
+ * is counted, reported, and fails the test: the silent `return 0` it replaces read as a pass. */
+static int g_skipped = 0;
+static int skip_case(const char *why)
+{
+    printf("  %s -- SKIP, counted as a failure\n", why);
+    g_skipped++;
+    return 1;
+}
 
 struct Shape {
     int IC, IH, IW, OC, KH, KW, sy, sx, dy, dx;
@@ -83,7 +97,7 @@ static int run_shape(int fd, const Shape &s)
     printf("%-22s IC=%d %dx%d -> OC=%d K=%dx%d s=%dx%d d=%dx%d %s bias=%d act=%d (OH=%d OW=%d)\n",
            s.name, s.IC, s.IH, s.IW, s.OC, s.KH, s.KW, s.sy, s.sx, s.dy, s.dx,
            s.same ? "SAME" : "VALID", s.use_bias, s.act, OH, OW);
-    if (OH <= 0 || OW <= 0) { printf("  bad output dims — SKIP\n"); return 0; }
+    if (OH <= 0 || OW <= 0) return skip_case("bad output dims");
 
     /* TFLite NHWC buffers, small integer values (exact in fp16). */
     std::vector<float> in((size_t)s.IH * s.IW * s.IC);
@@ -240,7 +254,7 @@ static int run_q_shape(int fd, const QShape &s)
            s.name, s.IC, s.IH, s.IW, s.OC, s.KH, s.KW, s.sy, s.sx, s.dy, s.dx,
            s.same ? "SAME" : "VALID", s.is_unsigned ? "u8" : "i8", s.use_bias, s.act,
            s.in_scale, s.in_zp, s.out_scale, s.out_zp, OH, OW);
-    if (OH <= 0 || OW <= 0) { printf("  bad output dims — SKIP\n"); return 0; }
+    if (OH <= 0 || OW <= 0) return skip_case("bad output dims");
 
     /* TFLite NHWC quantized buffers. Dequantized values stay small integers:
      * input (q-zp) in {-1,0,1}, weights (wq-zp) in {-1,0,1}, scales in {1,2}. */
@@ -329,8 +343,8 @@ static int run_ni8_shape(int fd, const QShape &s)
            s.name, s.IC, s.IH, s.IW, s.OC, s.KH, s.KW, s.sy, s.sx, s.dy, s.dx,
            s.same ? "SAME" : "VALID", s.use_bias, s.act,
            s.in_scale, s.in_zp, s.out_scale, s.out_zp, OH, OW);
-    if (OH <= 0 || OW <= 0) { printf("  bad output dims — SKIP\n"); return 0; }
-    if (s.is_unsigned) { printf("  native int8 path is signed-only — SKIP\n"); return 0; }
+    if (OH <= 0 || OW <= 0) return skip_case("bad output dims");
+    if (s.is_unsigned) return skip_case("native int8 path is signed-only");
 
     /* signed int8 tensors. Values span a moderate range (exact accumulate handles it);
      * scales keep most outputs inside int8 so the compare is discriminating. */
@@ -439,7 +453,7 @@ static int run_nu8_shape(int fd, const QShape &s)
            s.name, s.IC, s.IH, s.IW, s.OC, s.KH, s.KW, s.sy, s.sx, s.dy, s.dx,
            s.same ? "SAME" : "VALID", s.use_bias, s.act,
            s.in_scale, s.in_zp, s.w_zp, s.out_scale, s.out_zp, OH, OW);
-    if (OH <= 0 || OW <= 0) { printf("  bad output dims — SKIP\n"); return 0; }
+    if (OH <= 0 || OW <= 0) return skip_case("bad output dims");
 
     /* uint8 tensors. (in_q-in_zp) in {-2..2}, (w_q-w_zp) in {-3..3}, clamped to [0,255];
      * in_zp/w_zp asymmetric (incl. in_zp=0, the post-depthwise case) so the recenter +
@@ -694,7 +708,7 @@ static int run_dw_shape(int fd, const DWShape &s)
     printf("%-24s C=%d %dx%d K=%dx%d s=%dx%d d=%dx%d %s bias=%d act=%d (OH=%d OW=%d)\n",
            s.name, s.C, s.IH, s.IW, s.KH, s.KW, s.sy, s.sx, s.dy, s.dx,
            s.same ? "SAME" : "VALID", s.use_bias, s.act, OH, OW);
-    if (OH <= 0 || OW <= 0) { printf("  bad output dims — SKIP\n"); return 0; }
+    if (OH <= 0 || OW <= 0) return skip_case("bad output dims");
 
     /* TFLite NHWC buffers: input [1][IH][IW][C], depthwise filter [1][KH][KW][C]. */
     std::vector<float> in((size_t)s.IH * s.IW * s.C);
@@ -815,7 +829,7 @@ static int run_dw_q_shape(int fd, const DWQShape &s)
            s.name, s.C, s.IH, s.IW, s.KH, s.KW, s.sy, s.sx, s.dy, s.dx,
            s.same ? "SAME" : "VALID", s.is_unsigned ? "u8" : "i8", s.use_bias, s.act,
            s.in_scale, s.in_zp, s.out_scale, s.out_zp, OH, OW);
-    if (OH <= 0 || OW <= 0) { printf("  bad output dims — SKIP\n"); return 0; }
+    if (OH <= 0 || OW <= 0) return skip_case("bad output dims");
 
     /* TFLite NHWC quantized buffers: input [1][IH][IW][C], filter [1][KH][KW][C]. */
     std::vector<unsigned char> in((size_t)s.IH * s.IW * s.C);
@@ -1396,7 +1410,7 @@ static int run_pool(int fd, const PoolT &s) {
     printf("%-26s C=%d %dx%d K=%dx%d s=%dx%d %s %s act=%d %s (OH=%d OW=%d)\n",
            s.name, s.C, s.IH, s.IW, s.KH, s.KW, s.sy, s.sx, s.same ? "SAME" : "VALID",
            s.is_avg ? "avg" : "max", s.act, s.is_q ? (s.u ? "u8" : "i8") : "float", OH, OW);
-    if (OH <= 0 || OW <= 0) { printf("  bad dims — SKIP\n"); return 0; }
+    if (OH <= 0 || OW <= 0) return skip_case("bad dims");
     const int tot_h = rocket_total_pad(s.IH, s.KH, s.sy, 1, OH);
     const int tot_w = rocket_total_pad(s.IW, s.KW, s.sx, 1, OW);
     const int pt = tot_h / 2, pl = tot_w / 2;
@@ -1753,7 +1767,7 @@ static int run_ctx_shape(rocket_conv_ctx *ctx, int fd, const CtxShape &s)
     const int OH = rocket_conv2d_oh(&d), OW = rocket_conv2d_ow(&d);
     printf("%-34s IC=%d %dx%d OC=%d K=%dx%d s=%dx%d dw=%d (OH=%d OW=%d)\n",
            s.name, s.IC, s.IH, s.IW, s.OC, s.KH, s.KW, s.sy, s.sx, s.dw, OH, OW);
-    if (OH <= 0 || OW <= 0 || rocket_conv2d_plan(&d)) { printf("  unsupported — SKIP\n"); return 0; }
+    if (OH <= 0 || OW <= 0 || rocket_conv2d_plan(&d)) return skip_case("unsupported");
 
     const size_t in_n = (size_t)s.IC * s.IH * s.IW;
     const size_t w_n  = s.dw ? (size_t)s.OC * s.KH * s.KW : (size_t)s.OC * s.IC * s.KH * s.KW;
@@ -2400,6 +2414,16 @@ int main(void)
     fail |= run_nchw_bias_act_test(192, 32, 32, ROCKET_ACT_RELU, "nchw_bias_act C=192");printf("\n");
 
     if (fd >= 0) rocket_close(fd);
+    if (g_skipped) printf("%d listed case(s) ran nothing\n", g_skipped);
+#if defined(__aarch64__)
+    /* On the target the conv cases exist to run the glue on the NPU. Without the device the CPU
+     * oracle still checks the glue, but the device half did not run, which is a SKIP (2) rather
+     * than a PASS. A failure still exits 1. */
+    if (fd < 0 && !fail) {
+        printf("==== SKIP: no NPU (%d); the CPU-oracle half passed, the device half did not run ====\n", fd);
+        return 2;
+    }
+#endif
     printf("==== %s ====\n", fail ? "FAIL" : "PASS");
     return fail ? 1 : 0;
 }

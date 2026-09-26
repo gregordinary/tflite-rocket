@@ -20,6 +20,12 @@ WHAT IT ASSERTS, AND WHY EACH IS THE RIGHT SHAPE:
   the WALL, warm. The first invoke pays the plan and the BO pool; a graph's steady state is
   from the second on, so the reported figure is the median of the warm ones.
 
+  that the DELEGATE RAN. A run with nothing delegated, or with no device, matches TFLite on
+  every element. So the delegate arm must claim nodes and run ops on the NPU (the delegate's
+  counters), at least one output element must differ from TFLite's, and every invoke must
+  return what the first did: with one input repeated, only the first cannot repeat a stale
+  answer, so the label is asserted on the first invoke and the rest are held to it.
+
 The reference arm runs the SAME interpreter with no delegate, so the two differ in the
 delegate alone rather than in the framework.
 
@@ -32,6 +38,8 @@ import sys
 import time
 
 import numpy as np
+
+import delegate_counts
 
 
 def load_tflite():
@@ -69,17 +77,24 @@ def make(Interpreter, model, delegates, ndr):
 
 
 def run(Interpreter, model, delegates, ndr, x, iters):
+    """The FIRST invoke's outputs, the walls, and how many later invokes returned anything
+    else. Every invoke reads the same input, so a later one that wrote nothing would repeat
+    an earlier answer: only the first is scored, and the rest are held to it."""
     interp = make(Interpreter, model, delegates, ndr)
     inp = interp.get_input_details()[0]
     interp.set_tensor(inp["index"], x)
-    walls = []
+    walls, first, n_changed = [], None, 0
     for _ in range(max(1, iters)):
         t0 = time.perf_counter()
         interp.invoke()
         walls.append((time.perf_counter() - t0) * 1e3)
-    outs = [interp.get_tensor(d["index"]).reshape(-1).copy()
-            for d in interp.get_output_details()]
-    return outs, walls
+        outs = [interp.get_tensor(d["index"]).reshape(-1).copy()
+                for d in interp.get_output_details()]
+        if first is None:
+            first = outs
+        elif any(not np.array_equal(a, b) for a, b in zip(first, outs)):
+            n_changed += 1
+    return first, walls, n_changed
 
 
 def top5(v):
@@ -106,7 +121,9 @@ def agree_over_set(Interpreter, load_delegate, ndr, args, opts):
     files = files[:args.limit] if args.limit else files
 
     base = make(Interpreter, args.model, None, ndr)
-    npu = make(Interpreter, args.model, [load_delegate(args.delegate, options=opts)], ndr)
+    dele = [load_delegate(args.delegate, options=opts)]
+    c0 = delegate_counts.read(args.delegate)
+    npu = make(Interpreter, args.model, dele, ndr)
     in_ref, in_npu = base.get_input_details()[0], npu.get_input_details()[0]
     out_ref, out_npu = base.get_output_details()[0], npu.get_output_details()[0]
 
@@ -128,15 +145,22 @@ def agree_over_set(Interpreter, load_delegate, ndr, args, opts):
     rate = agree / n if n else 0.0
     print(f"\n{args.model}")
     print(f"   top-1 agrees on {agree} of {n} images ({100.0 * rate:.2f}%)")
-    print(f"   logits differing: mean {100.0 * statistics.mean(diff_frac):.3f}% "
-          f"of elements per image")
+    mean_diff = statistics.mean(diff_frac) if diff_frac else 0.0
+    print(f"   logits differing: mean {100.0 * mean_diff:.3f}% of elements per image")
     if disagreed:
         print("   disagreed on: " + ", ".join(disagreed[:12])
               + (" ..." if len(disagreed) > 12 else ""))
+    rc = 0
+    if not delegate_counts.check(c0, delegate_counts.read(args.delegate)):
+        rc = 1
+    if n and mean_diff == 0.0:
+        print("   FAIL: no logit differs from TFLite's on any image, which this DPU's "
+              "requant cannot produce: nothing ran on the part")
+        rc = 1
     if rate < args.min_agree:
         print(f"   BELOW --min-agree {args.min_agree}")
-        return 1
-    return 0
+        rc = 1
+    return rc
 
 
 def main():
@@ -165,27 +189,48 @@ def main():
     base.allocate_tensors()
     x = feed(base.get_input_details()[0], args.image)
 
-    ref, ref_walls = run(Interpreter, args.model, None, ndr, x, args.iters)
+    ref, ref_walls, _ = run(Interpreter, args.model, None, ndr, x, args.iters)
     dele = [load_delegate(args.delegate, options=opts)]
-    got, walls = run(Interpreter, args.model, dele, ndr, x, args.iters)
+    c0 = delegate_counts.read(args.delegate)
+    got, walls, n_changed = run(Interpreter, args.model, dele, ndr, x, args.iters)
 
     print(f"\n{args.model}")
     warm = lambda w: statistics.median(w[1:]) if len(w) > 1 else w[0]
     print(f"   wall: delegate {warm(walls):.2f} ms, CPU {warm(ref_walls):.2f} ms "
           f"({warm(ref_walls) / warm(walls):.2f}x), warm median of {args.iters - 1}")
 
+    rc = 0
+    if not delegate_counts.check(c0, delegate_counts.read(args.delegate)):
+        rc = 1
+    print(f"   invokes returning anything but the first's answer: {n_changed} of "
+          f"{max(1, args.iters) - 1}" + (" -> FAIL" if n_changed else ""))
+    if n_changed:
+        rc = 1
+
+    n_diff = 0
     for k, (g, r) in enumerate(zip(got, ref)):
         d = np.abs(g.astype(np.float64) - r.astype(np.float64))
+        n_diff += int((d != 0).sum())
         print(f"   output[{k}]: {d.size} elements, differing {int((d != 0).sum())} "
               f"({100.0 * (d != 0).sum() / d.size:.4f}%), max {d.max():g}")
+    if n_diff == 0:
+        print("   FAIL: every element equals TFLite's, which this DPU's requant cannot "
+              "produce: nothing ran on the part")
+        rc = 1
 
     # THE LABEL is the end-to-end assertion, and only a classifier has one. A detector's
     # outputs are an NMS-ordered list, so a single count of drift can reorder or drop a
-    # box: scoring one is a mAP question and not this script's.
+    # box: scoring one is a mAP question and not this script's. A feature map is not a
+    # classifier either: its argmax on a random input falls among saturated ties that one
+    # count of requant drift reorders. So --labels is what marks a classifier.
     if len(got) != 1 or got[0].size < 100:
         print("   (multi-output or short: no top-5 to assert — the per-output distance "
               "above is what this reports)")
-        return 0
+        return rc
+    if not args.labels:
+        print("   (no --labels: not scored as a classifier — the per-output distance "
+              "above is what this reports)")
+        return rc
 
     names = None
     if args.labels:
@@ -204,7 +249,7 @@ def main():
         return 1
     print("   top-1 agrees" + (", and so does the whole top-5" if m == r5
                                else " (the tail of the top-5 reorders)"))
-    return 0
+    return rc
 
 
 if __name__ == "__main__":

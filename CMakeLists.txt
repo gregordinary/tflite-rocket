@@ -126,6 +126,8 @@ if(ROCKET_TFLITE_BUILD_TESTS)
     target_link_libraries(convert_test PRIVATE rocketnpu::rocketnpu)
     target_compile_options(convert_test PRIVATE -Wall -Wextra)
     add_test(NAME convert_test COMMAND convert_test)   # CPU oracle on x86, HW glue on RK3588 hardware
+    # 2 = an aarch64 host whose accel node does not open: the device half did not run.
+    set_tests_properties(convert_test PROPERTIES SKIP_RETURN_CODE 2)
 
     # Host-only box-sum gate: forks a child per ROCKET_BOXSUM_MODE, cross-checks the three
     # NEON realizations are byte-identical, and microbenches them. No NPU needed (pure host

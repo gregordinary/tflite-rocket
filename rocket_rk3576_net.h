@@ -759,6 +759,9 @@ public:
                                  "[rocket/rk3576] the kick at layer %u returned %d\n", i, rc);
                     return kTfLiteError;
                 }
+                // The delegate's process-wide counters, defined before this header is
+                // included (rocket_delegate.cpp): a kick counts every layer it covers.
+                g_rocket_ops_npu += (long)(last - i + 1u);
                 i = last;
                 continue;
             }
@@ -769,6 +772,8 @@ public:
                              kind_name(layers_[i].kind), rc);
                 return kTfLiteError;
             }
+            // A concat is a host copy, or nothing when its producers wrote their slices.
+            (layers_[i].kind == ROCKET_GRAPH_CONCAT ? g_rocket_ops_host : g_rocket_ops_npu)++;
         }
 
         // The partition's OUTPUTS, back to NHWC.

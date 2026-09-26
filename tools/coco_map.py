@@ -15,11 +15,17 @@
 # CPU-only (no --delegate) validates the index->coco_id map + preprocessing: a correct
 # pipeline gives MobileDet ~0.22-0.25 mAP; a wrong class map gives ~0.
 #
+# With --delegate it exits 1 when the delegate did not run: nothing claimed, no op on the NPU
+# (the delegate's counters), or detections identical to the CPU arm's on every image, which
+# the part's requant cannot produce. The mAP delta is reported, not asserted.
+#
 # The interpreter comes from tflite_runtime, ai_edge_litert or tensorflow, whichever is
 # installed — an aarch64 board has the first two and no TFLite build.
 import argparse, json, os, sys
 import numpy as np
 from PIL import Image
+
+import delegate_counts
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
@@ -179,15 +185,25 @@ def main():
     if args.delegate:
         opts = parse_options(args.option, ap)
         print(f"== rocket delegate {opts} ==")
+        c0 = delegate_counts.read(args.delegate)
         npu = make_interp(args.model, args.delegate, opts)
         npu_res = detections(npu, ids, all_imgs, args.images, args.score_thr)
+        c1 = delegate_counts.read(args.delegate)
         dump("delegate", npu_res)
         deleg_map = evaluate(coco_gt, npu_res, ids)
 
     print("\n==== SUMMARY ====")
     print(f"  CPU      mAP@[.5:.95] = {cpu_map:.4f}")
+    rc = 0
     if deleg_map is not None:
         print(f"  delegate mAP@[.5:.95] = {deleg_map:.4f}  (delta {deleg_map-cpu_map:+.4f})")
+        if not delegate_counts.check(c0, c1):
+            rc = 1
+        if npu_res == cpu_res:
+            print("   FAIL: the delegate's detections equal the CPU arm's on every image, which "
+                  "the part's requant cannot produce: nothing ran on the part")
+            rc = 1
+    return rc
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
