@@ -159,7 +159,11 @@ static inline void rocket_unary_f(const float *in, float *out, size_t n, int kin
     for (size_t i = 0; i < n; i++) out[i] = rocket_unary_eval(kind, in[i], param);
 }
 
-/* int8/uint8: dequant per-tensor -> f(x) in float -> requant to the output type. */
+/* int8/uint8: dequant per-tensor -> f(x) in float -> requant to the output type.
+ * Each output byte is a function of its input byte alone, so the 256 codes are
+ * evaluated once and the elements looked up: the same bytes as a per-element pass,
+ * with 256 evaluations of f per call instead of n (EfficientDet-Lite0's class-score
+ * LOGISTIC is 1.73M elements). */
 static inline void rocket_unary_q(const void *in, void *out, size_t n, int kind,
                                   int in_uns, int out_uns,
                                   float in_scale, int in_zp,
@@ -167,11 +171,16 @@ static inline void rocket_unary_q(const void *in, void *out, size_t n, int kind,
 {
     int qmin, qmax; rocket_qrange(out_uns, &qmin, &qmax);
     const float inv = 1.0f / out_scale;
-    for (size_t i = 0; i < n; i++) {
-        float v = rocket_dq1(rocket_qread(in, i, in_uns), in_scale, in_zp);
+    unsigned char lut[256];
+    for (int b = 0; b < 256; b++) {
+        const int q = in_uns ? b : (int)(signed char)b;
+        float v = rocket_dq1(q, in_scale, in_zp);
         v = rocket_unary_eval(kind, v, param);
-        rocket_qwrite(out, i, rocket_rq1(v, inv, out_zp, qmin, qmax), out_uns);
+        rocket_qwrite(lut, (size_t)b, rocket_rq1(v, inv, out_zp, qmin, qmax), out_uns);
     }
+    const unsigned char *s = (const unsigned char *)in;
+    unsigned char *d = (unsigned char *)out;
+    for (size_t i = 0; i < n; i++) d[i] = lut[s[i]];
 }
 
 /* ==========================================================================
@@ -193,7 +202,30 @@ static inline void rocket_add_q(const void *a, const void *b, void *o, size_t n,
 {
     int qmin, qmax; rocket_qrange(o_uns, &qmin, &qmax);
     const float inv = 1.0f / o_scale;
-    for (size_t i = 0; i < n; i++) {
+    size_t i = 0;
+#if defined(__ARM_NEON)
+    /* Sixteen elements at a time with the same operations in the same order: each operand
+     * dequantized by a multiply, the two added, the act, a multiply by 1/scale and a round
+     * to nearest even (lrintf's), + zp and the clamp. The scalar loop compiles to separate
+     * multiplies and adds, so nothing here fuses either. */
+    const float32x4_t vsa = vdupq_n_f32(a_scale), vsb = vdupq_n_f32(b_scale);
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    const int32x4_t vza = vdupq_n_s32(a_zp), vzb = vdupq_n_s32(b_zp), vzo = vdupq_n_s32(o_zp);
+    const int32x4_t vlo = vdupq_n_s32(qmin), vhi = vdupq_n_s32(qmax);
+    for (; i + 16 <= n; i += 16) {
+        int32x4_t xa[4], xb[4], q[4];
+        rocket_widen16((const unsigned char *)a + i, a_uns, xa);
+        rocket_widen16((const unsigned char *)b + i, b_uns, xb);
+        for (int k = 0; k < 4; k++) {
+            float32x4_t va = vmulq_f32(vsa, vcvtq_f32_s32(vsubq_s32(xa[k], vza)));
+            float32x4_t vb = vmulq_f32(vsb, vcvtq_f32_s32(vsubq_s32(xb[k], vzb)));
+            float32x4_t v  = rocket_apply_act_f32x4(vaddq_f32(va, vb), act);
+            q[k] = vminq_s32(vmaxq_s32(vaddq_s32(vcvtnq_s32_f32(vmulq_f32(v, vinv)), vzo), vlo), vhi);
+        }
+        vst1q_u8((unsigned char *)o + i, rocket_narrow16(q[0], q[1], q[2], q[3]));
+    }
+#endif
+    for (; i < n; i++) {
         float va = rocket_dq1(rocket_qread(a, i, a_uns), a_scale, a_zp);
         float vb = rocket_dq1(rocket_qread(b, i, b_uns), b_scale, b_zp);
         float v  = rocket_apply_act(va + vb, act);
@@ -365,6 +397,64 @@ static inline void rocket_pool_q(const void *in, void *out,
 {
     int qmin, qmax; rocket_qrange(out_uns, &qmin, &qmax);
     const float inv = 1.0f / out_scale;
+    if (!is_avg) {
+        /* MAX: the dequant, the act and the requant are all non-decreasing, so the window's
+         * result is that chain applied to its largest stored value. Take the byte max in the
+         * input's own domain (sixteen channels a vector) and look the chain up in a 256-entry
+         * table built by the same arithmetic. A window with no in-plane tap keeps the max
+         * identity, -inf, as the float loop does. */
+        unsigned char lut[256];
+        for (int b = 0; b < 256; b++) {
+            const int q = in_uns ? b : (int)(signed char)b;
+            const float r = rocket_apply_act(rocket_dq1(q, in_scale, in_zp), act);
+            rocket_qwrite(lut, (size_t)b, rocket_rq1(r, inv, out_zp, qmin, qmax), out_uns);
+        }
+        const unsigned char empty = (unsigned char)rocket_rq1(rocket_apply_act(-INFINITY, act),
+                                                              inv, out_zp, qmin, qmax);
+        const unsigned char *src = (const unsigned char *)in;
+        unsigned char *dst = (unsigned char *)out;
+        const unsigned char flip = in_uns ? 0x00 : 0x80;   /* int8 max as an unsigned max */
+        for (int oh = 0; oh < OH; oh++)
+            for (int ow = 0; ow < OW; ow++) {
+                unsigned char *d = dst + ((size_t)oh * OW + ow) * C;
+                int c = 0;
+#if defined(__ARM_NEON)
+                const uint8x16_t vf = vdupq_n_u8(flip);
+                for (; c + 16 <= C; c += 16) {
+                    uint8x16_t m = vdupq_n_u8(0);
+                    int any = 0;
+                    for (int kh = 0; kh < KH; kh++) {
+                        const int ih = oh * sy + kh - pad_top;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            const int iw = ow * sx + kw - pad_left;
+                            if (iw < 0 || iw >= IW) continue;
+                            m = vmaxq_u8(m, veorq_u8(vld1q_u8(src + ((size_t)ih * IW + iw) * C + c), vf));
+                            any = 1;
+                        }
+                    }
+                    unsigned char mb[16];
+                    vst1q_u8(mb, veorq_u8(m, vf));
+                    for (int j = 0; j < 16; j++) d[c + j] = any ? lut[mb[j]] : empty;
+                }
+#endif
+                for (; c < C; c++) {
+                    int best = -1;               /* the largest flipped byte, as an unsigned */
+                    for (int kh = 0; kh < KH; kh++) {
+                        const int ih = oh * sy + kh - pad_top;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int kw = 0; kw < KW; kw++) {
+                            const int iw = ow * sx + kw - pad_left;
+                            if (iw < 0 || iw >= IW) continue;
+                            const int u = src[((size_t)ih * IW + iw) * C + c] ^ flip;
+                            if (u > best) best = u;
+                        }
+                    }
+                    d[c] = best < 0 ? empty : lut[(unsigned char)(best ^ flip)];
+                }
+            }
+        return;
+    }
     for (int oh = 0; oh < OH; oh++)
         for (int ow = 0; ow < OW; ow++)
             for (int c = 0; c < C; c++) {
@@ -479,15 +569,25 @@ static inline void rocket_concat_in_q(const void *in, void *out,
 {
     int qmin, qmax; rocket_qrange(out_uns, &qmin, &qmax);
     const float inv = 1.0f / out_scale;
+    /* One input's requant is a function of its byte alone: a 256-entry table, and a
+     * plain row copy when that table is the identity (matching quant, no clamp). */
+    unsigned char lut[256];
+    int ident = 1;
+    for (int b = 0; b < 256; b++) {
+        const int q = in_uns ? b : (int)(signed char)b;
+        float v = rocket_dq1(q, in_scale, in_zp);
+        v = rocket_apply_act(v, act);
+        rocket_qwrite(lut, (size_t)b, rocket_rq1(v, inv, out_zp, qmin, qmax), out_uns);
+        ident &= lut[b] == (unsigned char)b;
+    }
+    const unsigned char *s = (const unsigned char *)in;
+    unsigned char *d = (unsigned char *)out;
     for (int o = 0; o < outer; o++)
         for (int j = 0; j < in_axis; j++) {
-            size_t sbase = ((size_t)o * in_axis  + j)            * inner;
-            size_t dbase = ((size_t)o * out_axis + axis_off + j) * inner;
-            for (int k = 0; k < inner; k++) {
-                float v = rocket_dq1(rocket_qread(in, sbase + k, in_uns), in_scale, in_zp);
-                v = rocket_apply_act(v, act);
-                rocket_qwrite(out, dbase + k, rocket_rq1(v, inv, out_zp, qmin, qmax), out_uns);
-            }
+            const unsigned char *src = s + ((size_t)o * in_axis  + j)            * inner;
+            unsigned char       *dst = d + ((size_t)o * out_axis + axis_off + j) * inner;
+            if (ident) { memcpy(dst, src, (size_t)inner); continue; }
+            for (int k = 0; k < inner; k++) dst[k] = lut[src[k]];
         }
 }
 

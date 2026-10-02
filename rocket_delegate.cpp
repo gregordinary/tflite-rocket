@@ -22,8 +22,9 @@
  * SAME fp16 conv, then requantizes the output — an fp16 approximation of TFLite's
  * int8 kernel. With the `native_int8` option a NATIVE int8/uint8 conv path
  * runs int8 directly on the NPU with no host dequant (direct + 1x1, plus per-tensor
- * symmetric depthwise via the int8-out on-chip-requant runtime); per-channel DW int8
- * and uint8 depthwise fall back to the fp16 approximation. See rocket_convert.h.
+ * int8 or uint8 depthwise via the int8-out on-chip-requant runtime, whose DPU carries an
+ * asymmetric weight zero point); a per-channel depthwise falls back to the fp16
+ * approximation. See rocket_convert.h.
  *
  * Beyond conv, the delegate also claims the ops a real detector graph carries AROUND
  * its convolutions so the partitioner can take CONTIGUOUS subgraphs instead of one
@@ -116,8 +117,40 @@ struct RocketOptions {
                                 // requant) instead of the dequant->fp16->requant approx.
                                 // EXACT int8 accumulate (bit-identical to TFLite's int8
                                 // CPU kernel up to the <=1 requant rounding), no host
-                                // dequant/requant round-trip. OFF by default for an A/B;
-                                // uint8 + depthwise use the fp16 path.
+                                // dequant/requant round-trip. OFF by default for an A/B.
+                                // uint8 direct convs recenter to int8; a per-tensor
+                                // depthwise (int8 or uint8) takes the on-chip requant.
+    bool dw_perc = true;        // under native_int8: a PER-AXIS int8 depthwise (TFLite's default
+                                // depthwise quantization) takes the library's per-channel entry,
+                                // the BS stage's per-channel multiplier, instead of the
+                                // dequant->fp16->requant route. Within one count of TFLite, like
+                                // the per-tensor native_dw. dw_perc=0 is the A/B switch.
+    bool direct_i8out = true;   // under native_int8: a uint8 DIRECT conv with PER-TENSOR weights
+                                // that reaches the direct conv (not the 1x1 matmul route) runs the
+                                // library's int8-out writer (rocket_conv2d_int8_q, RK3588):
+                                // requantized on chip, the weight zero point on CPEND, so no int32
+                                // readback, box-sum or host requant. Within one count of TFLite at
+                                // a rounding boundary (the OUT_CVT's 15-bit multiplier), where the
+                                // int32-raw route's host requant is TFLite's. MobileDet 1.21-1.22x
+                                // unpinned on ondemand, 1.23-1.25x pinned. direct_i8out=0 is the
+                                // A/B switch back to the int32-raw route.
+    bool direct_perc = true;    // under native_int8: a signed-int8 DIRECT conv with PER-AXIS weights
+                                // (TFLite's default conv quantization) that reaches the direct conv
+                                // runs the library's per-channel int8-out entry
+                                // (rocket_conv2d_int8_q_perc, RK3588): each channel's scale on the
+                                // BS stage's multiplier, one OUT_CVT gain per scale-class job, so
+                                // no int32 readback or host requant. Within one count of TFLite at
+                                // a rounding boundary. With pw_i8out_min_m, EfficientDet-Lite0
+                                // 1.29-1.33x unpinned on ondemand, 1.21-1.25x pinned.
+                                // direct_perc=0 is the A/B switch back to the int32-raw route.
+    int  pw_i8out_min_m = 256;  // under native_int8: a 1x1 conv that the int8-out direct writer
+                                // takes (direct_i8out's uint8 per-tensor convs, direct_perc's
+                                // per-axis int8 ones) runs on it instead of the resident int8
+                                // matmul when its plane has at least this many pixels; direct_perc
+                                // also leaves a smaller conv on the int32-raw route. The writer won
+                                // every measured 1x1 at 400 pixels and up and lost most at 100, so
+                                // 256 sits between the measured sides. MobileDet 1.95-2.00x
+                                // unpinned, 1.37-1.41x pinned. 0 keeps every 1x1 on the matmul.
     bool mm_int8 = true;        // perf Step 1: route native int8/uint8 1x1 DIRECT convs to the
                                 // RESIDENT multicore int8 matmul (rocket_matmul_int8_prepacked)
                                 // instead of the single-core conv pool. A 1x1 IS a matmul; the
@@ -368,11 +401,19 @@ struct ConvNode {
     // NATIVE int8 path (native_int8 option). Set for a signed-int8 DIRECT/1x1 conv
     // with symmetric weights: int8 x int8 -> int32 on the NPU + host per-axis requant
     // (EXACT int8, no fp16 approximation). Mutually exclusive with the dequant->fp16
-    // path; uint8 / depthwise / w_zp!=0 keep is_quant on this struct but native=false.
+    // path; uint8 direct is native_u8, a per-tensor depthwise is native_dw, and anything
+    // else keeps is_quant on this struct with all three false.
     bool native = false;             // direct: int32-raw + per-axis requant
-    bool native_dw = false;          // depthwise: int8-out on-chip requant (per-tensor)
+    bool native_dw = false;          // depthwise: int8-out on-chip requant (per-tensor, int8
+                                     // or uint8 recentered by 128, host-padded)
+    bool dw_perc = false;            // native_dw with PER-AXIS int8 weights: the library's
+                                     // per-channel entry (rocket_conv2d_dw_int8_perc)
+    int  dw_amin = -128, dw_amax = 127;  // native_dw / u8_i8out / i8_perc: the fused act's clamp
     bool native_u8 = false;          // direct UINT8 (Option D): recenter to int8 + box-sum requant
     bool needs_boxsum = false;       // native_u8 with an asymmetric weight zp (some w_zp != 128)
+    bool u8_i8out = false;           // native_u8 on the int8-out writer (direct_i8out option)
+    bool i8_perc = false;            // native with PER-AXIS weights on the per-channel int8-out
+                                     // entry (direct_perc option)
     std::vector<int8_t>  w_i8;       // direct [OC][IC][KH][KW] / dw [C][KH][KW] raw int8
     std::vector<int32_t> eff_bias;   // direct: [OC] = bias_q - in_zp*Σ_kernel w_q
     std::vector<int32_t> bias_q;     // dw: raw TFLite int32 bias [C] (runtime folds the corr)
@@ -555,7 +596,8 @@ static bool analyze_conv(const TfLiteRegistration *reg, const TfLiteNode *node,
             // NATIVE int8: signed-int8 DIRECT/1x1 with symmetric weights only.
             // A quant conv always takes the conv path (mm_ok is float-only), and conv_ok
             // is already required above, so the int8 runtime can run it (1x1 = degenerate
-            // conv). uint8 / depthwise / per-axis w_zp!=0 stay on the dequant->fp16 path.
+            // conv). uint8 direct and depthwise have their own routes below; a per-axis
+            // w_zp!=0 direct int8 conv stays on the dequant->fp16 path.
             bool all_w_sym = true;
             for (int oc = 0; oc < OC; oc++) if (wz[oc] != 0) { all_w_sym = false; break; }
             const bool all_i8 = in.type == kTfLiteInt8 && flt.type == kTfLiteInt8 &&
@@ -575,7 +617,7 @@ static bool analyze_conv(const TfLiteRegistration *reg, const TfLiteNode *node,
             // host (x=in_q-128, y=w_q-128 — always in range), reuse the SAME int32-raw NPU
             // conv, and fold the centering into eff_bias + a per-output-pixel box-sum
             // correction (the price of w_zp != 128). No symmetry requirement; uint8
-            // depthwise stays on fp16 (a follow-on). Mutually exclusive with native (i8 vs u8).
+            // depthwise takes native_dw below. Mutually exclusive with native (i8 vs u8).
             out->native_u8 = opts.native_int8 && !is_dw && all_u8 && in_zp_u8_ok;
             if (out->native_u8) {
                 // box-sum is only needed when some weight zp != 128 (else beta == 0); the
@@ -584,10 +626,13 @@ static bool analyze_conv(const TfLiteRegistration *reg, const TfLiteNode *node,
                 for (int oc = 0; oc < OC; oc++) if (wz[oc] != 128) { sym128 = false; break; }
                 out->needs_boxsum = !sym128;
             }
-            // DEPTHWISE native (int8-out on-chip requant): PER-TENSOR quant only (the on-chip
-            // requant is one OUT_CVT scale; per-channel DW needs BS_MUL, stays on fp16) and a SYMMETRIC pad
-            // (the runtime uses the CNA's symmetric HW pad — the validated config; an
-            // asymmetric SAME pad falls back to fp16). w_zp==0 (symmetric weights).
+            // DEPTHWISE native (int8-out on-chip requant), int8 or uint8: PER-TENSOR quant only
+            // (the on-chip requant is one OUT_CVT scale; a per-channel DW stays on fp16). Any
+            // per-tensor weight zero point: the DPU's CPEND operand adds -w_zp times each
+            // window's input sum. A uint8 tensor is recentered by 128. The SAME pad is
+            // materialized on the host, so an odd total pad (a stride-2 layer on an even plane)
+            // is taken too, and the library's planner decides the shape on the materialized
+            // descriptor `d`, the one Eval programs.
             bool w_per_tensor = false;
             if (flt.quantization.type == kTfLiteAffineQuantization && flt.quantization.params) {
                 const auto *aq =
@@ -596,8 +641,33 @@ static bool analyze_conv(const TfLiteRegistration *reg, const TfLiteNode *node,
             } else if (flt.params.scale != 0.f) {
                 w_per_tensor = true;                       // legacy per-tensor
             }
-            out->native_dw = opts.native_int8 && is_dw && all_i8 && all_w_sym &&
-                             w_per_tensor && (tot_h % 2 == 0) && (tot_w % 2 == 0) && in_zp_i8_ok;
+            out->native_dw = opts.native_int8 && is_dw && (all_i8 || all_u8) && w_per_tensor &&
+                             (all_u8 ? in_zp_u8_ok : in_zp_i8_ok) &&
+                             rocket_conv2d_dw_int8_plan(&d) == ROCKET_OK;
+            // A PER-AXIS int8 depthwise (symmetric by construction): the per-channel entry,
+            // which carries each channel's scale on the DPU's BS multiplier.
+            if (!out->native_dw && opts.native_int8 && opts.dw_perc && is_dw && all_i8 &&
+                !w_per_tensor && all_w_sym && in_zp_i8_ok &&
+                rocket_conv2d_dw_int8_perc_plan(&d) == ROCKET_OK) {
+                out->native_dw = true;
+                out->dw_perc = true;
+            }
+            // DIRECT uint8 on the int8-out writer: per-tensor weights (one OUT_CVT scale a job),
+            // any weight zero point (CPEND), the library's planner on the materialized `d`.
+            out->u8_i8out = opts.direct_i8out && out->native_u8 && w_per_tensor &&
+                            rocket_conv2d_int8_q_plan(&d) == ROCKET_OK;
+            // DIRECT int8 with PER-AXIS weights (symmetric, which `native` requires) on the
+            // per-channel int8-out entry: each channel's scale on the BS multiplier. Under
+            // pw_i8out_min_m, only a conv whose output plane has at least that many pixels:
+            // below it the int32-raw route's host requant is cheaper than the entry's per-call
+            // plan and its extra scale-class jobs.
+            out->i8_perc = opts.direct_perc && out->native && !w_per_tensor &&
+                           (opts.pw_i8out_min_m <= 0 || OH * OW >= opts.pw_i8out_min_m) &&
+                           rocket_conv2d_int8_q_perc_plan(&d) == ROCKET_OK;
+            if (out->native_dw || out->u8_i8out || out->i8_perc)
+                rocket_act_range_q(act, outp.params.scale, outp.params.zero_point,
+                                   all_u8 ? 0 : -128, all_u8 ? 255 : 127,
+                                   &out->dw_amin, &out->dw_amax);
             out->has_bias_q = has_bias;
             out->w_scale = std::move(ws);
             out->w_zp    = std::move(wz);
@@ -2052,7 +2122,7 @@ public:
             const TfLiteTensor &in = context->tensors[c.in_idx];
             const int M = (in.dims && in.dims->size == 4)
                         ? in.dims->data[1] * in.dims->data[2] : 0;
-            const bool want = (M > 0) && conv_is_matmul_i8(c, M);
+            const bool want = (M > 0) && conv_is_matmul_i8(c, M, opts_.pw_i8out_min_m);
             if (c.mm_w_i8 && (!want || c.mm_i8_M != M)) {     // stale (resize) / no longer eligible
                 rocket_i8_weights_free(mm_i8_ctx_, c.mm_w_i8);
                 c.mm_w_i8 = nullptr;
@@ -2169,11 +2239,15 @@ public:
             // Print the op as it STARTS (not just after it succeeds) so a failing op is
             // visible — the success-only timing print below can't name the op that died.
             if (opts_.profile) {
-                if (n.kind == NodeKind::Conv)
-                    fprintf(stderr, "[rocket] op %d: %s K=%dx%d IC=%d OC=%d s=%dx%d %s route=%s ...\n",
+                if (n.kind == NodeKind::Conv) {
+                    const TfLiteIntArray *id = context->tensors[n.conv.in_idx].dims;
+                    const bool d4 = id && id->size == 4;
+                    fprintf(stderr, "[rocket] op %d: %s K=%dx%d IC=%d OC=%d s=%dx%d in=%dx%d %s route=%s ...\n",
                             op_i, n.conv.depthwise ? "dwconv" : "conv",
                             n.conv.KH, n.conv.KW, n.conv.IC, n.conv.OC, n.conv.sy, n.conv.sx,
+                            d4 ? id->data[1] : 0, d4 ? id->data[2] : 0,
                             n.conv.is_quant ? "quant" : "float", conv_route_name(n.conv));
+                }
                 else
                     fprintf(stderr, "[rocket] op %d: %s %s ...\n", op_i, node_op_name(n),
                             node_loc_tag(n));
@@ -2253,7 +2327,11 @@ private:
     // conv whose M meets the matmul's M%4||M==1 alignment. K (IC) and N (OC) are zero-padded
     // to %32, so only M gates here (a 5x5/3x3 SSD-head feature with M=25/9 stays on the
     // conv path — tiny, ~14M of the 588M 1x1 MACs). Decided in Prepare; Eval routes on mm_w_i8.
-    static bool conv_is_matmul_i8(const ConvNode &c, int M) {
+    // A 1x1 the int8-out direct writer takes (u8_i8out, i8_perc) leaves the matmul when its
+    // plane has at least pw_min_m pixels (the pw_i8out_min_m option; 0 keeps it there): at
+    // large planes the writer's int8 output beats the matmul's int32 C and host requant.
+    static bool conv_is_matmul_i8(const ConvNode &c, int M, int pw_min_m) {
+        if (pw_min_m > 0 && M >= pw_min_m && (c.u8_i8out || c.i8_perc)) return false;
         return (c.native || c.native_u8) &&
                c.KH == 1 && c.KW == 1 && c.sy == 1 && c.sx == 1 &&
                c.dy == 1 && c.dx == 1 && (M % 4 == 0 || M == 1) && M >= 1;
@@ -2287,9 +2365,10 @@ private:
     // Which conv route Eval takes, for the profile line: the native int8 depthwise, the native
     // int8 or uint8 direct conv, or the fp16 conv (float, or quant through dequant and requant).
     static const char *conv_route_name(const ConvNode &c) {
-        if (c.native_dw) return "native-dw-int8";
-        if (c.native)    return "native-int8";
-        if (c.native_u8) return "native-uint8";
+        if (c.native_dw) return c.dw_perc ? "native-dw-perc" :
+                                c.in_uns ? "native-dw-uint8" : "native-dw-int8";
+        if (c.native)    return c.i8_perc && !c.mm_w_i8 ? "native-int8-perc" : "native-int8";
+        if (c.native_u8) return c.u8_i8out && !c.mm_w_i8 ? "native-uint8-i8out" : "native-uint8";
         return "fp16";
     }
 
@@ -2462,6 +2541,10 @@ private:
             c.eff_bias.resize(c.OC);
             rocket_eff_bias_per_axis(c.w_i8.data(), bq, c.in_zp, c.eff_bias.data(),
                                      c.OC, c.IC, c.KH, c.KW);
+            if (c.i8_perc) {        // the per-channel entry folds the input zero point itself
+                c.bias_q.assign(c.OC, 0);
+                if (bq) for (int i = 0; i < c.OC; i++) c.bias_q[i] = bq[i];
+            }
             c.packed = true;
             return kTfLiteOk;
         }
@@ -2482,6 +2565,10 @@ private:
             c.eff_bias.resize(c.OC);
             rocket_eff_bias_u8_per_axis(c.w_i8.data(), bq, c.in_zp, c.w_zp.data(),
                                         c.eff_bias.data(), c.OC, c.IC, c.KH, c.KW);
+            if (c.u8_i8out) {       // the int8-out writer folds the zero points itself
+                c.bias_q.assign(c.OC, 0);
+                if (bq) for (int i = 0; i < c.OC; i++) c.bias_q[i] = bq[i];
+            }
             c.packed = true;
             return kTfLiteOk;
         }
@@ -2491,8 +2578,12 @@ private:
         // itself). Per-tensor quant; OC==IC==C.
         if (c.native_dw) {
             c.w_i8.resize((size_t)c.OC * c.KH * c.KW);
-            rocket_dw_filter_i8_to_chw((const signed char *)flt.data.data, c.w_i8.data(),
-                                       c.OC, c.KH, c.KW);
+            if (c.w_uns)
+                rocket_dw_filter_u8_to_chw((const unsigned char *)flt.data.data, c.w_i8.data(),
+                                           c.OC, c.KH, c.KW);
+            else
+                rocket_dw_filter_i8_to_chw((const signed char *)flt.data.data, c.w_i8.data(),
+                                           c.OC, c.KH, c.KW);
             c.bias_q.assign(c.OC, 0);
             if (c.bias_idx >= 0) {
                 const int32_t *bq = context->tensors[c.bias_idx].data.i32;
@@ -2629,6 +2720,44 @@ private:
             d.kh = c.KH; d.kw = c.KW; d.stride_y = c.sy; d.stride_x = c.sx;
             d.pad_top = 0; d.pad_left = 0; d.dil_y = c.dy; d.dil_x = c.dx; d.depthwise = 0;
             if (rocket_conv2d_oh(&d) != OH || rocket_conv2d_ow(&d) != OW) return kTfLiteError;
+            if (c.i8_perc) {
+                // the per-channel int8-out entry: requantized on chip per channel; the output
+                // comes back int8 NCHW and the write-out applies the fused act's clamp
+                std::vector<int8_t> in_nchw((size_t)IC * IHp * IWp);
+                std::vector<int8_t> out_nchw((size_t)OC * OH * OW);
+                const auto ts0 = std::chrono::steady_clock::now();
+                rocket_in_i8_to_nchw_pad(in_q, in_nchw.data(), IC, IH, IW, c.in_zp,
+                                         tot_h / 2, tot_w / 2, IHp, IWp);
+                const auto ts1 = std::chrono::steady_clock::now();
+                const int32_t *bq = c.bias_q.empty() ? nullptr : c.bias_q.data();
+                int rc = conv_pool_
+                    ? rocket_conv2d_int8_q_perc_mt(conv_pool_, &d, in_nchw.data(), c.w_i8.data(), bq,
+                          c.in_scale, c.w_scale.data(), c.out_scale, c.in_zp, c.out_zp, out_nchw.data())
+                    : conv_ctx_
+                    ? rocket_conv2d_int8_q_perc_ctx(conv_ctx_, &d, in_nchw.data(), c.w_i8.data(), bq,
+                          c.in_scale, c.w_scale.data(), c.out_scale, c.in_zp, c.out_zp, out_nchw.data())
+                    : rocket_conv2d_int8_q_perc(fd_, &d, in_nchw.data(), c.w_i8.data(), bq,
+                          c.in_scale, c.w_scale.data(), c.out_scale, c.in_zp, c.out_zp, out_nchw.data());
+                if (rc != 0) {
+                    if (opts_.profile)
+                        fprintf(stderr, "[rocket]   rocket_conv2d_int8_q_perc ret=%d (IC=%d OC=%d IHp=%d "
+                                "IWp=%d K=%dx%d s=%dx%d)\n", rc, IC, OC, IHp, IWp,
+                                c.KH, c.KW, c.sy, c.sx);
+                    return kTfLiteError;
+                }
+                const auto ts2 = std::chrono::steady_clock::now();
+                parallel_oh(OH, (size_t)OH * OW * OC, opts_.nthreads, [&](int oh0, int oh1) {
+                    rocket_out_dw_i8_to_nhwc_q_band(out_nchw.data(), (unsigned char *)out_q, OC,
+                                                    OH, OW, 0, c.dw_amin, c.dw_amax, oh0, oh1);
+                });
+                if (opts_.profile) {
+                    using msd = std::chrono::duration<double, std::milli>;
+                    const auto ts3 = std::chrono::steady_clock::now();
+                    fprintf(stderr, "[rocket]   breakdown in=%.3f conv=%.3f out=%.3f ms [native i8 perc]\n",
+                            msd(ts1 - ts0).count(), msd(ts2 - ts1).count(), msd(ts3 - ts2).count());
+                }
+                return kTfLiteOk;
+            }
             std::vector<int8_t>  in_nchw((size_t)IC * IHp * IWp);
             std::vector<int32_t> out_nchw((size_t)OC * OH * OW);
             const auto ts0 = std::chrono::steady_clock::now();
@@ -2678,6 +2807,47 @@ private:
             d.kh = c.KH; d.kw = c.KW; d.stride_y = c.sy; d.stride_x = c.sx;
             d.pad_top = 0; d.pad_left = 0; d.dil_y = c.dy; d.dil_x = c.dx; d.depthwise = 0;
             if (rocket_conv2d_oh(&d) != OH || rocket_conv2d_ow(&d) != OW) return kTfLiteError;
+            if (c.u8_i8out) {
+                // the int8-out writer: recentered by 128 like the int32-raw route, then
+                // requantized on chip; the output comes back int8 NCHW and the write-out
+                // adds 128 back and applies the fused act's clamp
+                if (rocket_conv2d_int8_q_plan(&d) != ROCKET_OK) return kTfLiteError;
+                std::vector<int8_t> in_nchw((size_t)IC * IHp * IWp);
+                std::vector<int8_t> out_nchw((size_t)OC * OH * OW);
+                const auto ts0 = std::chrono::steady_clock::now();
+                rocket_in_u8_to_nchw_pad(in_q, in_nchw.data(), IC, IH, IW, c.in_zp,
+                                         tot_h / 2, tot_w / 2, IHp, IWp);
+                const auto ts1 = std::chrono::steady_clock::now();
+                const int32_t *bq = c.bias_q.empty() ? nullptr : c.bias_q.data();
+                const int in_zp = c.in_zp - 128, w_zp = c.w_zp[0] - 128, out_zp = c.out_zp - 128;
+                int rc = conv_pool_
+                    ? rocket_conv2d_int8_q_mt(conv_pool_, &d, in_nchw.data(), c.w_i8.data(), bq,
+                          c.in_scale, c.w_scale[0], c.out_scale, in_zp, w_zp, out_zp, out_nchw.data())
+                    : conv_ctx_
+                    ? rocket_conv2d_int8_q_ctx(conv_ctx_, &d, in_nchw.data(), c.w_i8.data(), bq,
+                          c.in_scale, c.w_scale[0], c.out_scale, in_zp, w_zp, out_zp, out_nchw.data())
+                    : rocket_conv2d_int8_q(fd_, &d, in_nchw.data(), c.w_i8.data(), bq,
+                          c.in_scale, c.w_scale[0], c.out_scale, in_zp, w_zp, out_zp, out_nchw.data());
+                if (rc != 0) {
+                    if (opts_.profile)
+                        fprintf(stderr, "[rocket]   rocket_conv2d_int8_q(u8) ret=%d (IC=%d OC=%d IHp=%d "
+                                "IWp=%d K=%dx%d s=%dx%d)\n", rc, IC, OC, IHp, IWp,
+                                c.KH, c.KW, c.sy, c.sx);
+                    return kTfLiteError;
+                }
+                const auto ts2 = std::chrono::steady_clock::now();
+                parallel_oh(OH, (size_t)OH * OW * OC, opts_.nthreads, [&](int oh0, int oh1) {
+                    rocket_out_dw_i8_to_nhwc_q_band(out_nchw.data(), out_q, OC, OH, OW, 128,
+                                                    c.dw_amin, c.dw_amax, oh0, oh1);
+                });
+                if (opts_.profile) {
+                    using msd = std::chrono::duration<double, std::milli>;
+                    const auto ts3 = std::chrono::steady_clock::now();
+                    fprintf(stderr, "[rocket]   breakdown in=%.3f conv=%.3f out=%.3f ms [native u8 i8out]\n",
+                            msd(ts1 - ts0).count(), msd(ts2 - ts1).count(), msd(ts3 - ts2).count());
+                }
+                return kTfLiteOk;
+            }
             std::vector<int8_t>  in_nchw((size_t)IC * IHp * IWp);
             std::vector<int32_t> out_nchw((size_t)OC * OH * OW);
             const auto ts0 = std::chrono::steady_clock::now();
@@ -2736,47 +2906,78 @@ private:
         //     on-chip requant. TFLite's accumulator exactly, its output within one at a
         //     rounding boundary. ---
         if (c.native_dw) {
-            const signed char *in_q  = (const signed char *)in.data.data;
-            signed char       *out_q = (signed char *)outp.data.data;
-            if (!in_q || !out_q) return kTfLiteError;
+            if (!in.data.data || !outp.data.data) return kTfLiteError;
+            // Materialize the SAME pad on the host (TFLite puts the odd row/column at the
+            // bottom/right), padded with the input zero point, and program pad 0: a padded
+            // tap then contributes nothing, exactly as TFLite's padding does. A uint8 tensor
+            // is recentered by 128 on the way in and back on the way out; every zero point
+            // moves with it, so the arithmetic is unchanged.
             const int tot_h = rocket_total_pad(IH, c.KH, c.sy, c.dy, OH);
             const int tot_w = rocket_total_pad(IW, c.KW, c.sx, c.dx, OW);
-            // Re-check the symmetric-pad gate on LIVE shapes. analyze_conv gated
-            // native_dw on even tot_h/tot_w at Init, but a resize can make them odd;
-            // d.pad_top/left = tot/2 (floor) would then feed an ASYMMETRIC SAME pad to
-            // the symmetric-only HW config -> silently wrong output. The external
-            // delegate can't un-delegate at Eval, so fail the Invoke (matches the
-            // OH/OW re-check just below).
-            if ((tot_h % 2) != 0 || (tot_w % 2) != 0) {
+            const int IHp = IH + tot_h, IWp = IW + tot_w;
+            rocket_conv2d_desc d = {};
+            d.ic = IC; d.ih = IHp; d.iw = IWp; d.oc = OC;
+            d.kh = c.KH; d.kw = c.KW; d.stride_y = c.sy; d.stride_x = c.sx;
+            d.pad_top = 0; d.pad_left = 0; d.dil_y = c.dy; d.dil_x = c.dx; d.depthwise = 1;
+            if (rocket_conv2d_oh(&d) != OH || rocket_conv2d_ow(&d) != OW) return kTfLiteError;
+            // Init planned the model's shape; a resize can move it past the program's
+            // envelope, and an external delegate cannot un-delegate at Eval.
+            if ((c.dw_perc ? rocket_conv2d_dw_int8_perc_plan(&d)
+                           : rocket_conv2d_dw_int8_plan(&d)) != ROCKET_OK) {
                 if (opts_.profile)
-                    fprintf(stderr, "[rocket]   native_dw: asymmetric pad after resize "
-                            "(tot_h=%d tot_w=%d) -> kTfLiteError\n", tot_h, tot_w);
+                    fprintf(stderr, "[rocket]   native_dw: C=%d %dx%d past the int8 depthwise "
+                            "program after a resize -> kTfLiteError\n", IC, IHp, IWp);
                 return kTfLiteError;
             }
-            rocket_conv2d_desc d = {};
-            d.ic = IC; d.ih = IH; d.iw = IW; d.oc = OC;
-            d.kh = c.KH; d.kw = c.KW; d.stride_y = c.sy; d.stride_x = c.sx;
-            d.pad_top = tot_h / 2; d.pad_left = tot_w / 2;   // symmetric (re-checked above)
-            d.dil_y = c.dy; d.dil_x = c.dx; d.depthwise = 1;
-            if (rocket_conv2d_oh(&d) != OH || rocket_conv2d_ow(&d) != OW) return kTfLiteError;
-            std::vector<int8_t> in_nchw((size_t)IC * IH * IW);
+            const int sh = c.in_uns ? 128 : 0;
+            std::vector<int8_t> in_nchw((size_t)IC * IHp * IWp);
             std::vector<int8_t> out_nchw((size_t)OC * OH * OW);
-            rocket_in_i8_to_nchw_pad(in_q, in_nchw.data(), IC, IH, IW, c.in_zp, 0, 0, IH, IW);
+            const auto ts0 = std::chrono::steady_clock::now();
+            if (c.in_uns)
+                rocket_in_u8_to_nchw_pad((const unsigned char *)in.data.data, in_nchw.data(),
+                                         IC, IH, IW, c.in_zp, tot_h / 2, tot_w / 2, IHp, IWp);
+            else
+                rocket_in_i8_to_nchw_pad((const signed char *)in.data.data, in_nchw.data(),
+                                         IC, IH, IW, c.in_zp, tot_h / 2, tot_w / 2, IHp, IWp);
+            const auto ts1 = std::chrono::steady_clock::now();
             const int32_t *bq = c.bias_q.empty() ? nullptr : c.bias_q.data();
-            int rc = conv_ctx_
-                ? rocket_conv2d_dw_int8_ctx(conv_ctx_, &d, in_nchw.data(), c.w_i8.data(), bq,
-                      c.in_scale, c.w_scale[0], c.out_scale, c.in_zp, c.w_zp[0], c.out_zp,
-                      out_nchw.data())
-                : rocket_conv2d_dw_int8(fd_, &d, in_nchw.data(), c.w_i8.data(), bq,
-                      c.in_scale, c.w_scale[0], c.out_scale, c.in_zp, c.w_zp[0], c.out_zp,
-                      out_nchw.data());
+            const int in_zp = c.in_zp - sh, w_zp = c.w_zp[0] - sh, out_zp = c.out_zp - sh;
+            int rc;
+            if (c.dw_perc)
+                rc = conv_ctx_
+                    ? rocket_conv2d_dw_int8_perc_ctx(conv_ctx_, &d, in_nchw.data(), c.w_i8.data(),
+                          bq, c.in_scale, c.w_scale.data(), c.out_scale, in_zp, out_zp,
+                          out_nchw.data())
+                    : rocket_conv2d_dw_int8_perc(fd_, &d, in_nchw.data(), c.w_i8.data(), bq,
+                          c.in_scale, c.w_scale.data(), c.out_scale, in_zp, out_zp,
+                          out_nchw.data());
+            else
+                rc = conv_ctx_
+                    ? rocket_conv2d_dw_int8_ctx(conv_ctx_, &d, in_nchw.data(), c.w_i8.data(), bq,
+                          c.in_scale, c.w_scale[0], c.out_scale, in_zp, w_zp, out_zp,
+                          out_nchw.data())
+                    : rocket_conv2d_dw_int8(fd_, &d, in_nchw.data(), c.w_i8.data(), bq,
+                          c.in_scale, c.w_scale[0], c.out_scale, in_zp, w_zp, out_zp,
+                          out_nchw.data());
             if (rc != 0) {
                 if (opts_.profile)
-                    fprintf(stderr, "[rocket]   rocket_conv2d_dw_int8 ret=%d (C=%d IH=%d IW=%d "
-                            "K=%dx%d s=%dx%d)\n", rc, IC, IH, IW, c.KH, c.KW, c.sy, c.sx);
+                    fprintf(stderr, "[rocket]   rocket_conv2d_dw_int8 ret=%d (C=%d IHp=%d IWp=%d "
+                            "K=%dx%d s=%dx%d)\n", rc, IC, IHp, IWp, c.KH, c.KW, c.sy, c.sx);
                 return kTfLiteError;
             }
-            rocket_out_nchw_to_nhwc_i8(out_nchw.data(), out_q, OC, OH, OW);
+            const auto ts2 = std::chrono::steady_clock::now();
+            unsigned char *out_q = (unsigned char *)outp.data.data;
+            parallel_oh(OH, (size_t)OH * OW * OC, opts_.nthreads, [&](int oh0, int oh1) {
+                rocket_out_dw_i8_to_nhwc_q_band(out_nchw.data(), out_q, OC, OH, OW, sh,
+                                                c.dw_amin, c.dw_amax, oh0, oh1);
+            });
+            if (opts_.profile) {
+                using msd = std::chrono::duration<double, std::milli>;
+                const auto ts3 = std::chrono::steady_clock::now();
+                fprintf(stderr, "[rocket]   breakdown in=%.3f conv=%.3f out=%.3f ms [native dw %s]\n",
+                        msd(ts1 - ts0).count(), msd(ts2 - ts1).count(), msd(ts3 - ts2).count(),
+                        c.dw_perc ? "perc" : c.in_uns ? "u8" : "i8");
+            }
             return kTfLiteOk;
         }
 
@@ -3010,7 +3211,7 @@ private:
             const int pt = tot_h / 2, pb = tot_h - tot_h / 2;
             const int pl = tot_w / 2, pr = tot_w - tot_w / 2;
             const bool avg_ok = !x.is_avg || (tot_h == 0 && tot_w == 0);
-            rocket_pool_desc d;
+            rocket_pool_desc d = {};   // all fields: an unset avg_exclude_pad made the plan refuse
             d.c = C; d.ih = IH; d.iw = IW; d.kh = x.kh; d.kw = x.kw;
             d.stride_y = x.sy; d.stride_x = x.sx;
             d.pad_top = pt; d.pad_left = pl; d.pad_bottom = pb; d.pad_right = pr;
@@ -3737,6 +3938,10 @@ TfLiteDelegate *tflite_plugin_create_delegate(
         else if (k == "nchw_resident") opts.nchw_resident = (rocket_opt_long("nchw_resident", v, 0) != 0);
         else if (k == "native_int8")   opts.native_int8   = (rocket_opt_long("native_int8", v, 0) != 0);
         else if (k == "mm_int8")       opts.mm_int8       = (rocket_opt_long("mm_int8", v, 1) != 0);
+        else if (k == "dw_perc")       opts.dw_perc       = (rocket_opt_long("dw_perc", v, 1) != 0);
+        else if (k == "direct_i8out")  opts.direct_i8out  = (rocket_opt_long("direct_i8out", v, 1) != 0);
+        else if (k == "direct_perc")   opts.direct_perc   = (rocket_opt_long("direct_perc", v, 1) != 0);
+        else if (k == "pw_i8out_min_m") opts.pw_i8out_min_m = (int)rocket_opt_long("pw_i8out_min_m", v, 256);
         else if (k == "act_npu")       opts.act_npu       = (rocket_opt_long("act_npu", v, 0) != 0);
         else if (k == "fc_npu")        opts.fc_npu        = (rocket_opt_long("fc_npu", v, 0) != 0);
         else if (k == "pool_npu")      opts.pool_npu      = (rocket_opt_long("pool_npu", v, 0) != 0);

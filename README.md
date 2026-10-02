@@ -2,10 +2,10 @@
 
 ## AI disclosure
 
-Except for the prior work it builds on, tflite-rocket was developed by AI, primarily Claude Code
-(Opus 4.8). Human involvement was mostly limited to setting project goals and providing hardware
-access. This is a side project for curiosity's sake, and it comes with no guarantee of quality,
-accuracy, or update frequency.
+Except for the prior work it builds on, tflite-rocket was developed by AI, primarily Claude. Human
+involvement was mostly limited to setting project goals and providing hardware access. This is a
+side project for curiosity's sake, and it comes with no guarantee of quality, accuracy, or update
+frequency.
 
 ## About tflite-rocket
 
@@ -113,7 +113,11 @@ RK3576 (H96 MAX M9, kernel 7.1.6, 786 MHz), each against the same interpreter wi
 | Inception V1-224 | 7.4 ms | 180.5 ms | 24.4x | 81/83 | 53/53 | 1 |
 | Inception V3-299 | 34.5 ms | 669.3 ms | 19.4x | 130/132 | 90/94 | 16 |
 | SSD-MobileNetV2-COCO | 17.0 ms | 109.0 ms | 6.4x | 87/111 | 70/82 | 6 |
-| EfficientDet-Lite0-320 | 120.3 ms | 122.7 ms | 1.0x | 231/267 | 85/89 | 10 |
+| EfficientDet-Lite0-320 | 55.5 ms | 123.1 ms | 2.2x | 238/267 | not re-read | not re-read |
+
+The EfficientDet-Lite0 row was re-measured on `rocket` 1.6.0 and kernel 7.2.3, both CPU clusters
+pinned, after the per-axis gain moved onto the BS shift (below). Its joins and kicks were not
+re-read.
 
 Four of the five classifiers go out as a single hardware kick covering the whole partition. All
 five return the interpreter's own top-1 label, and they differ from it on 0.2-1.3% of the output
@@ -131,20 +135,22 @@ That is the comparison a detector admits. Its output list is NMS-ordered, and on
 arithmetic drift reorders or drops a box, which makes an element-wise diff against the CPU
 meaningless.
 
-EfficientDet-Lite0 is the model with **per-axis** filter scales. 36 of its 267 nodes stay on
-the CPU. 29 are for op coverage. **The part cannot express the per-channel gain of the other
-7.**
+EfficientDet-Lite0 is the model with **per-axis** filter scales. 29 of its 267 nodes stay on
+the CPU, all for op coverage.
 
 A convolution runs as one hardware task carrying one output converter shift. Each output channel
-reaches its own scale through a 16-bit multiplier in its coefficient group. A channel whose scale
-sits below half its tile's base needs a multiplier under one, and the field's floor is one.
+reaches its own scale through a 16-bit multiplier in its coefficient group. A shift in the same
+stage lets the task's largest channel use the multiplier's whole range. A channel whose output
+cannot vary over its reachable inputs, such as a pruned all-zero filter, is programmed as that one
+byte. Only a live channel below 1/65534 of its task's largest scale is refused.
 
 The driver library answers that from the weights alone, with no device. This delegate asks it while
 deciding what to claim, where a refusal costs one node the framework runs itself. Asking at Prepare
 instead would fail the whole model.
 
-Refusing those 7 is what takes the model from mAP 0.0000 to parity. It costs 21 ms, because a node
-the delegate declines also splits the partition around it.
+On EfficientDet-Lite0 nothing is refused and no layer is split into output-channel tiles. It runs
+55.5 ms against 83.6 ms without the shift, and its mAP@[.5:.95] over 500 val2017 images is 0.2818
+against the CPU's 0.2823.
 
 The placement and linking rules (which tensors stay in cube layout, which producers write slices of
 one shared buffer, which runs of layers are one submit) are the driver library's `rocketgraph`
@@ -169,12 +175,15 @@ default in the Frigate `rocket.py` plugin). At a glance:
 | Metric | Result |
 |---|---|
 | COCO-val mAP@[.5:.95] | 0.3321 NPU vs 0.3318 CPU int8 (parity, 500 images) |
-| Warm single-stream latency | ~336 ms (host cube-gather-bound, not submit-bound) |
+| Warm single-stream latency, MobileDet | ~56 ms, governor pinned to `performance`, on the A76 cores; ~76 ms on the default `ondemand` governor |
 | Multi-camera pool, P=1->4 | 3.20 -> 9.55 detection_fps (2.98x at P=4, live Frigate) |
 
-A single inference is host cube-scatter/gather-bound, so the NPU's value is throughput under a
-multi-camera pool (Frigate's regime), not single-stream latency. The levers behind the ~336 ms
-single-stream figure (on MobileDet / MobileNetV2):
+The latency figures were measured on an RK1 at 600 MHz on 2026-09-28. The `ondemand` governor
+parks the cores that an offloading process leaves idle, which costs MobileDet 1.36x here, on a
+board whose A76 floor is 1.2 GHz.
+For latency, pin the big cores' governor to `performance`. The NPU's larger value is still
+throughput under a multi-camera pool (Frigate's regime). The levers behind the single-stream
+figure (on MobileDet / MobileNetV2):
 
 - **Resident device state.** Packing weights once in `Prepare` and reusing a resident 5-BO conv pool
   (`rocket_conv_ctx`) across calls/tiles removes the dominant per-op cost. Warm MobileNetV2 block
@@ -183,9 +192,62 @@ single-stream figure (on MobileDet / MobileNetV2):
   OC/OH/OW tiles across the 3 NPU cores, bit-exact. Warm MobileDet 560->458 ms (1.21x).
 - **1×1 int8/uint8 -> resident matmul** (`mm_int8`, default-on under `native_int8`): a 1×1 conv is a
   matmul, so routing it to `rocket_matmul_int8_prepacked` is +8% warm (366->336 ms), bit-exact.
+- **uint8 depthwise -> on-chip requant** (under `native_int8`): a per-tensor depthwise, int8 or
+  uint8, runs the int8-out program at any weight zero point instead of the fp16 approximation.
+  Warm MobileDet 1.06x and SSD MobileNet v2 1.05x (RK1, 600 MHz, governor pinned, process on the
+  A76 cores, four rotated passes), mAP unchanged. The library's depthwise pack, blocked rather than
+  per element, adds 1.12x and 1.10x with byte-identical outputs: MobileDet 205 -> 172 ms over both.
+- **Blocked host packs in the fp16 and int8 direct convs**, the same change in the library's other
+  conv entries. MobileDet runs 151 ms, SSD MobileNet v2 131 ms, and EfficientDet-Lite0 256 ms
+  where it ran 309, at that operating point and with byte-identical outputs.
+- **Right-sized matmul BOs**: the 1x1 route's output and regcmd BOs hold only the tiles a call
+  has, so each job syncs kilobytes rather than a 64-tile buffer. MobileDet runs 130 ms, SSD
+  MobileNet v2 120 ms and EfficientDet-Lite0 229 ms, outputs byte-identical.
+- **Table-driven quantized unary and concat**: a quantized unary op's output byte depends on its
+  input byte alone. The host kernel evaluates the 256 codes once and looks the elements up.
+  EfficientDet-Lite0's class-score LOGISTIC fell from 35 ms to 2.6, and its concat from 11 ms to
+  0.5. That is 1.22-1.25x on that model and 1.04x on the other two, outputs byte-identical.
+- **A one-K-tile matmul gathers into C directly**: a 1x1 conv's matmul is one K-tile, and the
+  library no longer routes it through an int64 accumulator and a second copy. MobileDet
+  1.07-1.09x, SSD MobileNet v2 1.04-1.07x, EfficientDet-Lite0 1.10-1.11x, byte-identical.
+- **`lrintf` inlined**: the delegate is built with `-fno-math-errno`, so its requant loops round
+  in-line instead of calling libm per element. EfficientDet-Lite0 1.05-1.08x, SSD MobileNet v2
+  1.03-1.04x, MobileDet 1.02-1.03x, byte-identical.
+- **Transposed conv packs**: the library packs a conv's planes into the cube with a NEON
+  transpose, 16 pixels of a channel group at a time. It gathers the output the same way.
+  MobileDet 1.07-1.08x, SSD MobileNet v2 1.11-1.13x, EfficientDet-Lite0 1.06-1.07x,
+  byte-identical.
+- **Transposed host conversions, a NEON add and a byte-max pool**: the delegate's own NHWC and
+  NCHW conversions use the same transpose on rows at least 16 wide. MobileDet 1.04-1.06x, SSD
+  MobileNet v2 1.09-1.11x, EfficientDet-Lite0 1.10-1.12x, byte-identical. With the governor
+  pinned and the process on the A76 cores, MobileDet runs ~100 ms, SSD MobileNet v2 85-86 ms and
+  EfficientDet-Lite0 133-135 ms.
+- **Per-axis int8 depthwise -> the per-channel multiplier** (`dw_perc`, default-on under
+  `native_int8`): TFLite quantizes a depthwise filter per channel by default. Such a layer runs
+  the int8-out program with each channel's scale on the DPU's per-channel multiplier. EfficientDet-Lite0's 76 depthwise layers: warm 1.095-1.104x, 133 -> 121 ms (RK1,
+  600 MHz, governor pinned, A76, four rotated passes), COCO mAP over 100 images 0.3019 against
+  the fp16 route's 0.2998 and the CPU's 0.2996.
+- **uint8 direct convs -> the int8-out writer** (`direct_i8out`, default-on under `native_int8`):
+  a uint8 direct conv with per-tensor weights is requantized on chip. The weight zero point rides
+  the DPU's CPEND operand, so there is no int32 readback, box-sum or host requant. Pinned,
+  MobileDet runs 1.23-1.25x (93 -> 75 ms) and SSD MobileNet v2 1.19x. Unpinned on `ondemand` they
+  run 1.21-1.22x and 1.17x. COCO mAP over 100 images moves 0.3990 -> 0.3994 and 0.3197 -> 0.3213.
+  Outputs move by at most one count, on 0.037% of MobileDet's direct-conv elements.
+- **Large-plane 1×1s -> the int8-out writer** (`pw_i8out_min_m`, 256 by default under
+  `native_int8`): a 1×1 at 16×16 and up runs the direct int8-out program. The int8 matmul's
+  int32 output and host requant cost more there. Pinned, MobileDet runs 1.37-1.41x
+  (77 -> 56 ms) and SSD MobileNet v2 1.23-1.28x. Unpinned on `ondemand` (`scaling_min_freq`
+  1.2 GHz) they run 1.95-2.00x (150 -> 76 ms) and 1.90x. The matmul route loses more to the
+  parked cores: its unpinned wall is 1.95x its pinned one, the direct route's 1.36x. COCO mAP
+  over 100 images moves 0.3994 -> 0.4040 and 0.3213 -> 0.3229 (CPU 0.3980, 0.3215).
+- **Per-axis int8 direct convs -> the per-channel int8-out entry** (`direct_perc`, default-on
+  under `native_int8`): each output channel's scale rides the DPU's per-channel multiplier.
+  EfficientDet-Lite0's convs at 256 pixels and up drop the int32 readback and the host
+  requant. The model runs 1.21-1.25x pinned (123 -> 101 ms) and 1.29-1.33x unpinned. COCO
+  mAP over 100 images moves 0.3019 -> 0.3023 (CPU 0.2996). Outputs move by at most one
+  count, on 0.16% of the conv outputs.
 - **COCO-val mAP: CPU parity.** MobileDet mAP@[.5:.95] = 0.3321 vs CPU 0.3318 (Δ +0.0002, 500 val
-  images, `tools/coco_map.py`). The fp16-approx depthwise and the missing per-channel DW int8 cost
-  ~0 mAP.
+  images, `tools/coco_map.py`).
 
 Throughput comes from running several detection contexts concurrently, one process per stream
 (exactly how Frigate runs cameras), each pinned to a distinct A76 core via `ROCKET_CPU_AFFINITY`. The

@@ -27,6 +27,17 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# The host kernels round each requantized element with lrintf. GCC keeps that a libm
+# call (it may set errno) unless errno is off for math functions, so every requant loop
+# pays a call an element and none of them vectorizes. Inlined, it is the same
+# round-to-nearest-even conversion, and nothing here reads errno.
+# -ffp-contract=off keeps each multiply and add a separately rounded IEEE operation. GCC's
+# GNU default lets it fuse a multiply into an add where it chooses, so one scalar loop
+# could round differently in two translation units, and the NEON kernels, which never
+# fuse, could not be held to it. convert_test takes the same flags so it scores the
+# kernels as the delegate compiles them.
+set(ROCKET_TFLITE_HOST_FLAGS -fno-math-errno -ffp-contract=off)
+
 # --- driver lib (shared foundation) ---
 # Prefer an installed rocketnpu CMake package (cmake --install of rocket-userspace, which
 # exports rocketnpu::rocketnpu); otherwise build it from a sibling checkout. Override
@@ -80,7 +91,7 @@ if(DEFINED TFLITE_DIR)
     # rocketnpu package rather than living here because a second copy of those rules would
     # fork silently; see rocket_rk3576_net.h.
     target_link_libraries(tflite_rocket PRIVATE rocketnpu::rocketgraph rocketnpu::rocketnpu)
-    target_compile_options(tflite_rocket PRIVATE -Wall -Wextra)
+    target_compile_options(tflite_rocket PRIVATE -Wall -Wextra ${ROCKET_TFLITE_HOST_FLAGS})
 
     # Portability: internalize the glibc 2.38 __isoc23_strtol/fscanf symbols so the .so
     # loads on an older-glibc runtime (e.g. a Debian-bookworm Frigate container) even
@@ -124,7 +135,7 @@ if(ROCKET_TFLITE_BUILD_TESTS)
     add_executable(convert_test tests/convert_test.cpp)
     target_include_directories(convert_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(convert_test PRIVATE rocketnpu::rocketnpu)
-    target_compile_options(convert_test PRIVATE -Wall -Wextra)
+    target_compile_options(convert_test PRIVATE -Wall -Wextra ${ROCKET_TFLITE_HOST_FLAGS})
     add_test(NAME convert_test COMMAND convert_test)   # CPU oracle on x86, HW glue on RK3588 hardware
     # 2 = an aarch64 host whose accel node does not open: the device half did not run.
     set_tests_properties(convert_test PROPERTIES SKIP_RETURN_CODE 2)

@@ -74,6 +74,123 @@ static inline float32x4_t rocket_apply_act_f32x4(float32x4_t v, int act)
 }
 #endif
 
+/* ── Pixels <-> planes, sixteen channels at a time ─────────────────────────────────
+ * An NHWC tensor holds a pixel's channels side by side, and the driver's NCHW one holds a
+ * channel's pixels side by side, so every boundary below is a transpose. Moved one channel
+ * a pass, each pass touches one byte of every pixel's channel line, a plane or OC apart. A
+ * 16x16 byte transpose (a perfect shuffle, zip rows j and j+8, four times) moves sixteen
+ * channels of sixteen pixels at once, so both ends are contiguous. The per-element
+ * arithmetic around it is the per-channel loop's, so every byte is the one that loop wrote. */
+#if defined(__ARM_NEON)
+static inline void rocket_tr16x16_u8(uint8x16_t v[16])
+{
+#pragma GCC unroll 4
+    for (int st = 0; st < 4; st++) {
+        uint8x16_t n[16];
+#pragma GCC unroll 8
+        for (int j = 0; j < 8; j++) {
+            n[2 * j]     = vzip1q_u8(v[j], v[j + 8]);
+            n[2 * j + 1] = vzip2q_u8(v[j], v[j + 8]);
+        }
+#pragma GCC unroll 16
+        for (int j = 0; j < 16; j++) v[j] = n[j];
+    }
+}
+
+/* 16 stored bytes -> four int32x4 of their values, read as uint8 or int8. */
+static inline void rocket_widen16(const unsigned char *p, int is_unsigned, int32x4_t out[4])
+{
+    const uint8x16_t b = vld1q_u8(p);
+    int16x8_t lo, hi;
+    if (is_unsigned) {
+        lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(b)));
+        hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(b)));
+    } else {
+        lo = vmovl_s8(vget_low_s8(vreinterpretq_s8_u8(b)));
+        hi = vmovl_s8(vget_high_s8(vreinterpretq_s8_u8(b)));
+    }
+    out[0] = vmovl_s16(vget_low_s16(lo));  out[1] = vmovl_s16(vget_high_s16(lo));
+    out[2] = vmovl_s16(vget_low_s16(hi));  out[3] = vmovl_s16(vget_high_s16(hi));
+}
+
+/* Four int32x4 already inside a byte's range -> their 16 low bytes, in order. */
+static inline uint8x16_t rocket_narrow16(int32x4_t a, int32x4_t b, int32x4_t c, int32x4_t d)
+{
+    const int16x8_t lo = vcombine_s16(vmovn_s32(a), vmovn_s32(b));
+    const int16x8_t hi = vcombine_s16(vmovn_s32(c), vmovn_s32(d));
+    return vreinterpretq_u8_s8(vcombine_s8(vmovn_s16(lo), vmovn_s16(hi)));
+}
+#endif
+
+/* Fill the halo of a [C][IHp][IWp] plane set whose real rows start at (pad_top, pad_left):
+ * whole rows above and below, and the columns either side of each real row. `fill` is
+ * one element of `esz` bytes, repeated. */
+static inline void rocket_fill_halo(void *dst, int C, int IH, int IW, int pad_top, int pad_left,
+                                    int IHp, int IWp, const void *fill, size_t esz)
+{
+    const size_t plane = (size_t)IHp * IWp;
+    unsigned char *base = (unsigned char *)dst;
+    for (int c = 0; c < C; c++)
+        for (int h = 0; h < IHp; h++) {
+            unsigned char *r = base + ((size_t)c * plane + (size_t)h * IWp) * esz;
+            const int real = h >= pad_top && h < pad_top + IH;
+            const int n0 = real ? pad_left : IWp;              /* halo columns before */
+            const int n1 = real ? IWp - pad_left - IW : 0;     /* and after the row */
+            for (int w = 0; w < n0; w++) memcpy(r + (size_t)w * esz, fill, esz);
+            for (int w = 0; w < n1; w++)
+                memcpy(r + (size_t)(pad_left + IW + w) * esz, fill, esz);
+        }
+}
+
+/* NHWC bytes -> NCHW bytes over [C][IHp][IWp], the real input at (pad_top, pad_left), every
+ * byte XORed with `flip` (0x80 re-centres uint8 as int8, 0 keeps the byte) and the halo
+ * `fill`. A row at least 16 pixels wide moves in blocks of sixteen pixels by sixteen
+ * channels; the channel and pixel tails, and a narrower plane, which stays in cache, take the
+ * per-channel loop. dst is fully written. */
+static inline void rocket_in_bytes_to_nchw_pad(
+        const unsigned char *src, unsigned char *dst, int C, int IH, int IW,
+        int pad_top, int pad_left, int IHp, int IWp, unsigned char fill, unsigned char flip)
+{
+    const size_t plane = (size_t)IHp * IWp;
+    const int C16 = C & ~15;
+    const int IWv = C16 && IW >= 16 ? (IW & ~15) : 0;   /* pixels a row moves in blocks */
+    if (!IWv) {
+        /* no block fits: the whole-buffer fill and the per-channel pass, which on a plane
+         * this narrow stays in cache and beats the halo walk */
+        memset(dst, fill, (size_t)C * plane);
+        for (int ih = 0; ih < IH; ih++)
+            for (int iw = 0; iw < IW; iw++) {
+                const unsigned char *px = src + ((size_t)ih * IW + iw) * C;
+                unsigned char *d = dst + (size_t)(ih + pad_top) * IWp + pad_left + iw;
+                for (int c = 0; c < C; c++) d[(size_t)c * plane] = px[c] ^ flip;
+            }
+        return;
+    }
+    rocket_fill_halo(dst, C, IH, IW, pad_top, pad_left, IHp, IWp, &fill, 1);
+    for (int ih = 0; ih < IH; ih++) {
+        const unsigned char *srow = src + (size_t)ih * IW * C;
+        unsigned char *drow = dst + (size_t)(ih + pad_top) * IWp + pad_left;
+#if defined(__ARM_NEON)
+        const uint8x16_t vf = vdupq_n_u8(flip);
+        for (int iw = 0; iw < IWv; iw += 16)
+            for (int c0 = 0; c0 < C16; c0 += 16) {
+                uint8x16_t v[16];
+                for (int k = 0; k < 16; k++) v[k] = vld1q_u8(srow + (size_t)(iw + k) * C + c0);
+                rocket_tr16x16_u8(v);
+                for (int j = 0; j < 16; j++)
+                    vst1q_u8(drow + (size_t)(c0 + j) * plane + iw, veorq_u8(v[j], vf));
+            }
+        const int iwv = IWv;
+#else
+        const int iwv = 0;
+        (void)IWv;
+#endif
+        for (int i = 0; i < IW; i++)
+            for (int c = i < iwv ? C16 : 0; c < C; c++)
+                drow[(size_t)c * plane + i] = srow[(size_t)i * C + c] ^ flip;
+    }
+}
+
 /* Effective kernel extent on one axis once dilation is applied. */
 static inline int rocket_eff_k(int k, int dil) { return (k - 1) * dil + 1; }
 
@@ -287,14 +404,61 @@ static inline void rocket_in_q_to_nchw_pad(
         lut[b] = (_Float16)(in_scale * (float)(q - in_zp));
     }
     const unsigned char *s = (const unsigned char *)src;
-    memset(dst, 0, (size_t)IC * IHp * IWp * sizeof(_Float16));
-    for (int ih = 0; ih < IH; ih++)
-        for (int iw = 0; iw < IW; iw++) {
-            size_t spix = ((size_t)ih * IW + iw) * IC;
-            size_t base = ((size_t)(ih + pad_top)) * IWp + (iw + pad_left);
-            for (int ic = 0; ic < IC; ic++)
-                dst[(size_t)ic * IHp * IWp + base] = lut[s[spix + ic]];
-        }
+    const size_t plane = (size_t)IHp * IWp;
+    const int C16 = IC & ~15;
+    const int IWv = C16 && IW >= 16 ? (IW & ~15) : 0;
+    if (!IWv) {
+        /* no block fits: the whole-buffer zero and the per-channel pass (see above) */
+        memset(dst, 0, (size_t)IC * plane * sizeof(_Float16));
+        for (int ih = 0; ih < IH; ih++)
+            for (int iw = 0; iw < IW; iw++) {
+                const unsigned char *px = s + ((size_t)ih * IW + iw) * IC;
+                _Float16 *d = dst + (size_t)(ih + pad_top) * IWp + pad_left + iw;
+                for (int c = 0; c < IC; c++) d[(size_t)c * plane] = lut[px[c]];
+            }
+        return;
+    }
+    const _Float16 zero = 0;
+    rocket_fill_halo(dst, IC, IH, IW, pad_top, pad_left, IHp, IWp, &zero, sizeof zero);
+#if defined(__ARM_NEON)
+    const int32x4_t vz = vdupq_n_s32(in_zp);
+    const float32x4_t vs = vdupq_n_f32(in_scale);
+#endif
+    for (int ih = 0; ih < IH; ih++) {
+        const unsigned char *srow = s + (size_t)ih * IW * IC;
+        _Float16 *drow = dst + (size_t)(ih + pad_top) * IWp + pad_left;
+#if defined(__ARM_NEON)
+        /* Sixteen channels of sixteen pixels transposed as bytes, then each channel's run
+         * dequantized in vector form with the table's own arithmetic (the stored value as an
+         * int, minus the zero point, to float, times the scale, rounded to fp16 nearest even). */
+        for (int iw = 0; iw < IWv; iw += 16)
+            for (int c0 = 0; c0 < C16; c0 += 16) {
+                uint8x16_t v[16];
+                for (int k = 0; k < 16; k++) v[k] = vld1q_u8(srow + (size_t)(iw + k) * IC + c0);
+                rocket_tr16x16_u8(v);
+                for (int j = 0; j < 16; j++) {
+                    unsigned char b[16];
+                    int32x4_t x[4];
+                    vst1q_u8(b, v[j]);
+                    rocket_widen16(b, is_unsigned, x);
+                    _Float16 *d = drow + (size_t)(c0 + j) * plane + iw;
+                    vst1q_f16((__fp16 *)d, vcombine_f16(
+                        vcvt_f16_f32(vmulq_f32(vs, vcvtq_f32_s32(vsubq_s32(x[0], vz)))),
+                        vcvt_f16_f32(vmulq_f32(vs, vcvtq_f32_s32(vsubq_s32(x[1], vz))))));
+                    vst1q_f16((__fp16 *)(d + 8), vcombine_f16(
+                        vcvt_f16_f32(vmulq_f32(vs, vcvtq_f32_s32(vsubq_s32(x[2], vz)))),
+                        vcvt_f16_f32(vmulq_f32(vs, vcvtq_f32_s32(vsubq_s32(x[3], vz))))));
+                }
+            }
+        const int iwv = IWv;
+#else
+        const int iwv = 0;
+        (void)IWv;
+#endif
+        for (int i = 0; i < IW; i++)
+            for (int c = i < iwv ? C16 : 0; c < IC; c++)
+                drow[(size_t)c * plane + i] = lut[srow[(size_t)i * IC + c]];
+    }
 }
 
 /*
@@ -377,12 +541,47 @@ static inline void rocket_out_nchw_to_nhwc_q_band(
     const int qmax = is_unsigned ? 255 : 127;
     const float inv = 1.0f / out_scale;
     const size_t plane = (size_t)OH * OW;
+    const size_t p0 = (size_t)oh0 * OW, p1 = (size_t)oh1 * OW;
+    int OCb = 0;
+    size_t pb = p0;
+    (void)p1;
+#if defined(__ARM_NEON)
+    /* Sixteen channels of sixteen pixels at a time: each channel's results computed as in the
+     * loop below (fp16 -> fp32, + bias, act, * inv, round to nearest even, + zp, clamp),
+     * narrowed to bytes, and transposed into sixteen pixels' channel runs. */
+    OCb = OC & ~15;
+    pb = p0 + ((p1 - p0) & ~(size_t)15);
+    {
+        const int32x4_t vlo = vdupq_n_s32(qmin), vhi = vdupq_n_s32(qmax), vzp = vdupq_n_s32(out_zp);
+        const float32x4_t vinv = vdupq_n_f32(inv);
+        for (int oc0 = 0; oc0 < OCb; oc0 += 16)
+            for (size_t pix = p0; pix < pb; pix += 16) {
+                uint8x16_t v[16];
+                for (int j = 0; j < 16; j++) {
+                    const float32x4_t vb = vdupq_n_f32(bias ? bias[oc0 + j] : 0.f);
+                    const _Float16 *sp = src + (size_t)(oc0 + j) * plane + pix;
+                    int32x4_t q[4];
+                    for (int i = 0; i < 4; i++) {
+                        float32x4_t f = vcvt_f32_f16(vld1_f16((const __fp16 *)(sp + 4 * i)));
+                        f = rocket_apply_act_f32x4(vaddq_f32(f, vb), act);
+                        q[i] = vminq_s32(vmaxq_s32(
+                                vaddq_s32(vcvtnq_s32_f32(vmulq_f32(f, vinv)), vzp), vlo), vhi);
+                    }
+                    v[j] = rocket_narrow16(q[0], q[1], q[2], q[3]);
+                }
+                rocket_tr16x16_u8(v);
+                for (int k = 0; k < 16; k++)
+                    vst1q_u8((unsigned char *)dst + (pix + k) * OC + oc0, v[k]);
+            }
+    }
+#endif
     for (int oc = 0; oc < OC; oc++) {          // oc-outer: contiguous src plane, hoisted bias
         const float b = bias ? bias[oc] : 0.f;
         const _Float16 *sp = src + (size_t)oc * plane;
         for (int oh = oh0; oh < oh1; oh++)
             for (int ow = 0; ow < OW; ow++) {
                 const size_t pix = (size_t)oh * OW + ow;
+                if (oc < OCb && pix < pb) continue;   /* the blocks wrote it */
                 float v = (float)sp[pix];
                 v += b;                 // b is 0 when bias==NULL (hoisted per-oc above)
                 v = rocket_apply_act(v, act);
@@ -467,14 +666,9 @@ static inline void rocket_in_i8_to_nchw_pad(
         const signed char *src, int8_t *dst, int IC, int IH, int IW, int in_zp,
         int pad_top, int pad_left, int IHp, int IWp)
 {
-    memset(dst, (unsigned char)(signed char)in_zp, (size_t)IC * IHp * IWp * sizeof(int8_t));
-    for (int ih = 0; ih < IH; ih++)
-        for (int iw = 0; iw < IW; iw++) {
-            const signed char *s = src + ((size_t)ih * IW + iw) * IC;
-            size_t base = ((size_t)(ih + pad_top)) * IWp + (iw + pad_left);
-            for (int ic = 0; ic < IC; ic++)
-                dst[(size_t)ic * IHp * IWp + base] = (int8_t)s[ic];
-        }
+    rocket_in_bytes_to_nchw_pad((const unsigned char *)src, (unsigned char *)dst, IC, IH, IW,
+                                pad_top, pad_left, IHp, IWp,
+                                (unsigned char)(signed char)in_zp, 0x00);
 }
 
 /* Depthwise int8 filter TFLite [1][KH][KW][C] -> driver [C][KH][KW], kept int8 (raw
@@ -501,6 +695,85 @@ static inline void rocket_out_nchw_to_nhwc_i8(
             size_t dpix = ((size_t)oh * OW + ow) * C;
             for (int c = 0; c < C; c++)
                 dst[dpix + c] = (signed char)src[((size_t)c * OH + oh) * OW + ow];
+        }
+}
+
+/* Depthwise uint8 filter TFLite [1][KH][KW][C] -> driver [C][KH][KW] int8, RE-CENTERED
+ * (y = w_q - 128), so the int8 depthwise entry takes it with weight zero point w_zp - 128.
+ * The shift is exact: (w_q - w_zp) == (y - (w_zp - 128)). Packed ONCE. */
+static inline void rocket_dw_filter_u8_to_chw(
+        const unsigned char *src, int8_t *dst, int C, int KH, int KW)
+{
+    for (int c = 0; c < C; c++)
+        for (int kh = 0; kh < KH; kh++)
+            for (int kw = 0; kw < KW; kw++)
+                dst[((size_t)c * KH + kh) * KW + kw] =
+                    (int8_t)((int)src[((size_t)kh * KW + kw) * C + c] - 128);
+}
+
+/* TFLite's quantized fused-activation range (CalculateActivationRangeQuantized): the clamp a
+ * quantized kernel applies AFTER its requant, in the output's quantized domain [qmin, qmax].
+ * A bound is out_zp + round(f / out_scale), rounded half away from zero as TfLiteRound is,
+ * and held inside [qmin, qmax]. */
+static inline void rocket_act_range_q(int act, float out_scale, int out_zp, int qmin, int qmax,
+                                      int *amin, int *amax)
+{
+    const float lo_f = act == ROCKET_ACT_RELUN1 ? -1.f : 0.f;
+    const float hi_f = act == ROCKET_ACT_RELU6 ? 6.f : 1.f;
+    int lo = qmin, hi = qmax;
+    if (act == ROCKET_ACT_RELU || act == ROCKET_ACT_RELU6 || act == ROCKET_ACT_RELUN1) {
+        const double q = (double)out_zp + roundf(lo_f / out_scale);
+        if (q > lo) lo = q > qmax ? qmax : (int)q;
+    }
+    if (act == ROCKET_ACT_RELU6 || act == ROCKET_ACT_RELUN1) {
+        const double q = (double)out_zp + roundf(hi_f / out_scale);
+        if (q < hi) hi = q < qmin ? qmin : (int)q;
+    }
+    *amin = lo;
+    *amax = hi;
+}
+
+/* The depthwise int8-out result, NCHW int8 in the entry's domain, -> TFLite NHWC bytes over
+ * output rows [oh0, oh1). Adds `offset` (128 for a uint8 tensor, 0 for int8) and clamps to
+ * [amin, amax], the fused activation's quantized range. The requant ran on chip, so this is
+ * the whole epilogue. Disjoint rows, so bands run in parallel. */
+static inline void rocket_out_dw_i8_to_nhwc_q_band(
+        const int8_t *src, unsigned char *dst, int C, int OH, int OW, int offset,
+        int amin, int amax, int oh0, int oh1)
+{
+    const size_t plane = (size_t)OH * OW;
+    const size_t p0 = (size_t)oh0 * OW, p1 = (size_t)oh1 * OW;
+    const int C16 = C & ~15;
+    size_t pb = p0;
+#if defined(__ARM_NEON)
+    /* offset 128 is a uint8 tensor: the byte s ^ 0x80, clamped unsigned; offset 0 is int8:
+     * the byte itself, clamped signed. Anything else takes the scalar loop. The blocks run
+     * over the band's flat pixels, which are contiguous at both ends. */
+    if (C16 && (offset == 128 || offset == 0)) {
+        const uint8x16_t ulo = vdupq_n_u8((unsigned char)amin), uhi = vdupq_n_u8((unsigned char)amax);
+        const int8x16_t slo = vdupq_n_s8((signed char)amin), shi = vdupq_n_s8((signed char)amax);
+        for (; pb + 16 <= p1; pb += 16)
+            for (int c0 = 0; c0 < C16; c0 += 16) {
+                uint8x16_t v[16];
+                const unsigned char *s = (const unsigned char *)src + pb;
+                for (int j = 0; j < 16; j++) v[j] = vld1q_u8(s + (size_t)(c0 + j) * plane);
+                rocket_tr16x16_u8(v);
+                for (int k = 0; k < 16; k++) {
+                    uint8x16_t b;
+                    if (offset == 128)
+                        b = vminq_u8(vmaxq_u8(veorq_u8(v[k], vdupq_n_u8(0x80)), ulo), uhi);
+                    else
+                        b = vreinterpretq_u8_s8(vminq_s8(vmaxq_s8(vreinterpretq_s8_u8(v[k]), slo), shi));
+                    vst1q_u8(dst + (pb + (size_t)k) * C + c0, b);
+                }
+            }
+    }
+#endif
+    for (size_t q = C16 == C ? pb : p0; q < p1; q++)      /* channel tails, then the pixel tail */
+        for (int c = q < pb ? C16 : 0; c < C; c++) {
+            int v = (int)src[(size_t)c * plane + q] + offset;
+            v = v < amin ? amin : (v > amax ? amax : v);
+            dst[q * C + c] = (unsigned char)v;
         }
 }
 
@@ -640,14 +913,9 @@ static inline void rocket_in_u8_to_nchw_pad(
         const unsigned char *src, int8_t *dst, int IC, int IH, int IW, int in_zp,
         int pad_top, int pad_left, int IHp, int IWp)
 {
-    memset(dst, (unsigned char)(signed char)(in_zp - 128), (size_t)IC * IHp * IWp * sizeof(int8_t));
-    for (int ih = 0; ih < IH; ih++)
-        for (int iw = 0; iw < IW; iw++) {
-            const unsigned char *s = src + ((size_t)ih * IW + iw) * IC;
-            size_t base = ((size_t)(ih + pad_top)) * IWp + (iw + pad_left);
-            for (int ic = 0; ic < IC; ic++)
-                dst[(size_t)ic * IHp * IWp + base] = (int8_t)((int)s[ic] - 128);
-        }
+    /* in_q - 128 as a byte is in_q ^ 0x80 */
+    rocket_in_bytes_to_nchw_pad(src, (unsigned char *)dst, IC, IH, IW, pad_top, pad_left,
+                                IHp, IWp, (unsigned char)(signed char)(in_zp - 128), 0x80);
 }
 
 /* Per-OC effective int32 bias for the native-uint8 requant:

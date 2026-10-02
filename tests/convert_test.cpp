@@ -994,6 +994,306 @@ static int run_act(const ActT &s) {
     return md == 0 ? 0 : 1;
 }
 
+/* ---- THE TRANSPOSED CONVERSIONS against the per-channel loops they replaced ----
+ * The input converters, the depthwise output, both per-axis requants and the fp16 route's
+ * input and output move sixteen channels of sixteen pixels at a time and fall back to the
+ * per-channel loop for the channel and pixel tails. Each runs here against a copy of the loop
+ * it replaced, byte for byte, at channel counts on and off 16, planes with and without a
+ * pixel tail, a padded halo, a band that starts inside the plane, and every fused act. */
+static uint32_t tr_rng = 20260927u;
+static uint32_t tr_next(void) { tr_rng = tr_rng * 1664525u + 1013904223u; return tr_rng >> 8; }
+
+static void ref_in_bytes(const unsigned char *src, unsigned char *dst, int C, int IH, int IW,
+                         int pt, int pl, int IHp, int IWp, unsigned char fill, unsigned char flip) {
+    memset(dst, fill, (size_t)C * IHp * IWp);
+    for (int ih = 0; ih < IH; ih++)
+        for (int iw = 0; iw < IW; iw++)
+            for (int c = 0; c < C; c++)
+                dst[(size_t)c * IHp * IWp + (size_t)(ih + pt) * IWp + iw + pl] =
+                    src[((size_t)ih * IW + iw) * C + c] ^ flip;
+}
+static void ref_out_dw(const int8_t *src, unsigned char *dst, int C, int OH, int OW, int offset,
+                       int amin, int amax, int oh0, int oh1) {
+    for (int oh = oh0; oh < oh1; oh++)
+        for (int ow = 0; ow < OW; ow++)
+            for (int c = 0; c < C; c++) {
+                int v = (int)src[((size_t)c * OH + oh) * OW + ow] + offset;
+                v = v < amin ? amin : (v > amax ? amax : v);
+                dst[((size_t)oh * OW + ow) * C + c] = (unsigned char)v;
+            }
+}
+static void ref_per_axis(const int32_t *src, unsigned char *dst, int uns, int OC, int OH, int OW,
+                         const int32_t *eb, const int *w_zp, const int32_t *Sx, int act,
+                         float in_s, const float *w_s, float out_s, int out_zp, int oh0, int oh1) {
+    const int qmin = uns ? 0 : -128, qmax = uns ? 255 : 127;
+    const float inv = 1.0f / out_s;
+    for (int oc = 0; oc < OC; oc++)
+        for (size_t pix = (size_t)oh0 * OW; pix < (size_t)oh1 * OW; pix++) {
+            long acc = (long)src[(size_t)oc * OH * OW + pix] + (eb ? eb[oc] : 0);
+            if (Sx) acc += (long)(128 - (w_zp ? w_zp[oc] : 128)) * Sx[pix];
+            float v = (in_s * w_s[oc]) * (float)acc;
+            v = rocket_apply_act(v, act);
+            long q = (long)lrintf(v * inv) + out_zp;
+            if (q < qmin) q = qmin;
+            if (q > qmax) q = qmax;
+            dst[pix * OC + oc] = (unsigned char)q;
+        }
+}
+static void ref_in_fp16(const unsigned char *src, int uns, float in_s, int in_zp, _Float16 *dst,
+                        int C, int IH, int IW, int pt, int pl, int IHp, int IWp) {
+    memset(dst, 0, (size_t)C * IHp * IWp * sizeof(_Float16));
+    for (int ih = 0; ih < IH; ih++)
+        for (int iw = 0; iw < IW; iw++)
+            for (int c = 0; c < C; c++) {
+                const unsigned char b = src[((size_t)ih * IW + iw) * C + c];
+                const int q = uns ? b : (int)(signed char)b;
+                dst[(size_t)c * IHp * IWp + (size_t)(ih + pt) * IWp + iw + pl] =
+                    (_Float16)(in_s * (float)(q - in_zp));
+            }
+}
+static void ref_out_fp16(const _Float16 *src, unsigned char *dst, int uns, int OC, int OH, int OW,
+                         const float *bias, int act, float out_s, int out_zp, int oh0, int oh1) {
+    const int qmin = uns ? 0 : -128, qmax = uns ? 255 : 127;
+    const float inv = 1.0f / out_s;
+    for (int oc = 0; oc < OC; oc++)
+        for (size_t pix = (size_t)oh0 * OW; pix < (size_t)oh1 * OW; pix++) {
+            float v = (float)src[(size_t)oc * OH * OW + pix];
+            v += bias ? bias[oc] : 0.f;
+            v = rocket_apply_act(v, act);
+            long q = (long)lrintf(v * inv) + out_zp;
+            if (q < qmin) q = qmin;
+            if (q > qmax) q = qmax;
+            dst[pix * OC + oc] = (unsigned char)q;
+        }
+}
+
+static void ref_add_q(const unsigned char *a, const unsigned char *b, unsigned char *o, size_t n,
+                      int au, int bu, int ou, float as, int az, float bs, int bz, float os, int oz,
+                      int act) {
+    const int qmin = ou ? 0 : -128, qmax = ou ? 255 : 127;
+    const float inv = 1.0f / os;
+    for (size_t i = 0; i < n; i++) {
+        const int qa = au ? a[i] : (int)(signed char)a[i], qb = bu ? b[i] : (int)(signed char)b[i];
+        float va = as * (float)(qa - az);
+        float vb = bs * (float)(qb - bz);
+        float v = rocket_apply_act(va + vb, act);
+        long q = (long)lrintf(v * inv) + oz;
+        if (q < qmin) q = qmin;
+        if (q > qmax) q = qmax;
+        o[i] = (unsigned char)q;
+    }
+}
+static void ref_maxpool_q(const unsigned char *in, unsigned char *out, int IH, int IW, int C,
+                          int OH, int OW, int KH, int KW, int sy, int sx, int pt, int pl, int act,
+                          int iu, int ou, float is, int iz, float os, int oz) {
+    const int qmin = ou ? 0 : -128, qmax = ou ? 255 : 127;
+    const float inv = 1.0f / os;
+    for (int oh = 0; oh < OH; oh++)
+        for (int ow = 0; ow < OW; ow++)
+            for (int c = 0; c < C; c++) {
+                float v = -INFINITY;
+                for (int kh = 0; kh < KH; kh++) {
+                    const int ih = oh * sy + kh - pt;
+                    if (ih < 0 || ih >= IH) continue;
+                    for (int kw = 0; kw < KW; kw++) {
+                        const int iw = ow * sx + kw - pl;
+                        if (iw < 0 || iw >= IW) continue;
+                        const unsigned char bb = in[((size_t)ih * IW + iw) * C + c];
+                        const float x = is * (float)((iu ? bb : (int)(signed char)bb) - iz);
+                        if (x > v) v = x;
+                    }
+                }
+                const float r = rocket_apply_act(v, act);
+                long q = (long)lrintf(r * inv) + oz;
+                if (q < qmin) q = qmin;
+                if (q > qmax) q = qmax;
+                out[((size_t)oh * OW + ow) * C + c] = (unsigned char)q;
+            }
+}
+
+static int run_vector_host_ops(void) {
+    int fail = 0, cases = 0;
+    const size_t ns[] = { 1, 15, 16, 17, 1037 };
+    for (int m = 0; m < 8; m++)
+        for (size_t t = 0; t < 5; t++)
+            for (int act = 0; act < 4; act++) {
+                const int au = m & 1, bu = (m >> 1) & 1, ou = (m >> 2) & 1;
+                const size_t n = ns[t];
+                std::vector<unsigned char> a(n), b(n), g(n + 16, 0x5A), r(n + 16, 0x5A);
+                for (auto &x : a) x = (unsigned char)tr_next();
+                for (auto &x : b) x = (unsigned char)tr_next();
+                rocket_add_q(a.data(), b.data(), g.data(), n, au, bu, ou, 0.031f, au ? 120 : -5,
+                             0.047f, bu ? 131 : 9, 0.06f, ou ? 127 : -2, act);
+                ref_add_q(a.data(), b.data(), r.data(), n, au, bu, ou, 0.031f, au ? 120 : -5,
+                          0.047f, bu ? 131 : 9, 0.06f, ou ? 127 : -2, act);
+                cases++;
+                if (g != r) { printf("  add signs %d n=%zu act %d FAIL\n", m, n, act); fail = 1; }
+            }
+    const int Cs[] = { 3, 16, 17, 40 };
+    const int HW[][2] = { { 5, 7 }, { 8, 8 }, { 9, 33 } };
+    const int K[][5] = { { 2, 2, 2, 0, 0 }, { 3, 3, 2, 1, 1 }, { 3, 3, 1, 1, 1 }, { 5, 5, 1, 4, 4 } };
+    for (int ci = 0; ci < 4; ci++)
+        for (int hi = 0; hi < 3; hi++)
+            for (int ki = 0; ki < 4; ki++)
+                for (int u = 0; u < 2; u++) {
+                    const int C = Cs[ci], IH = HW[hi][0], IW = HW[hi][1];
+                    const int KH = K[ki][0], KW = K[ki][1], st = K[ki][2], pt = K[ki][3], pl = K[ki][4];
+                    const int OH = (IH + 2 * pt - KH) / st + 1, OW = (IW + 2 * pl - KW) / st + 1;
+                    const int act = (ci + hi + ki) % 4;
+                    std::vector<unsigned char> in((size_t)IH * IW * C);
+                    for (auto &x : in) x = (unsigned char)tr_next();
+                    std::vector<unsigned char> g((size_t)OH * OW * C, 0x5A), r(g.size(), 0x5A);
+                    rocket_pool_q(in.data(), g.data(), IH, IW, C, OH, OW, KH, KW, st, st, pt, pl,
+                                  0, act, u, u, 0.05f, u ? 128 : 3, 0.07f, u ? 110 : -9);
+                    ref_maxpool_q(in.data(), r.data(), IH, IW, C, OH, OW, KH, KW, st, st, pt, pl,
+                                  act, u, u, 0.05f, u ? 128 : 3, 0.07f, u ? 110 : -9);
+                    cases++;
+                    if (g != r) { printf("  maxpool C=%d %dx%d k%d u=%d FAIL\n", C, IH, IW, ki, u); fail = 1; }
+                }
+    printf("%-26s %d cases against the scalar loops -> %s\n", "vector add and max pool", cases, fail ? "FAIL" : "PASS");
+    return fail;
+}
+
+static int run_transposed_conversions(void) {
+    const int Cs[] = { 3, 16, 17, 40, 64 };
+    const int HW[][2] = { { 1, 1 }, { 5, 7 }, { 4, 16 }, { 3, 33 }, { 18, 20 } };
+    int fail = 0, cases = 0;
+    for (int ci = 0; ci < 5; ci++)
+        for (int hi = 0; hi < 5; hi++)
+            for (int pad = 0; pad < 2; pad++) {
+                const int C = Cs[ci], H = HW[hi][0], W = HW[hi][1];
+                const int pt = pad, pl = 2 * pad, Hp = H + 2 * pad, Wp = W + 3 * pad;
+                const int act = (ci + hi + pad) % 4;
+                std::vector<unsigned char> in((size_t)H * W * C);
+                for (auto &b : in) b = (unsigned char)tr_next();
+                /* input converters: uint8 (re-centred) and int8 */
+                for (int u = 0; u < 2; u++) {
+                    const int zp = u ? 131 : -7;
+                    std::vector<int8_t> got((size_t)C * Hp * Wp), ref(got.size());
+                    if (u) rocket_in_u8_to_nchw_pad(in.data(), got.data(), C, H, W, zp, pt, pl, Hp, Wp);
+                    else   rocket_in_i8_to_nchw_pad((const signed char *)in.data(), got.data(), C, H, W, zp, pt, pl, Hp, Wp);
+                    ref_in_bytes(in.data(), (unsigned char *)ref.data(), C, H, W, pt, pl, Hp, Wp,
+                                 (unsigned char)(signed char)(u ? zp - 128 : zp), u ? 0x80 : 0x00);
+                    cases++;
+                    if (memcmp(got.data(), ref.data(), got.size())) { printf("  in %s C=%d %dx%d pad=%d FAIL\n", u ? "u8" : "i8", C, H, W, pad); fail = 1; }
+                    /* fp16 route input, through its table */
+                    std::vector<_Float16> fg((size_t)C * Hp * Wp), fr(fg.size());
+                    rocket_in_q_to_nchw_pad(in.data(), u, 0.0371f, zp, fg.data(), C, H, W, pt, pl, Hp, Wp);
+                    ref_in_fp16(in.data(), u, 0.0371f, zp, fr.data(), C, H, W, pt, pl, Hp, Wp);
+                    cases++;
+                    if (memcmp(fg.data(), fr.data(), fg.size() * sizeof(_Float16))) { printf("  in fp16 u=%d C=%d %dx%d pad=%d FAIL\n", u, C, H, W, pad); fail = 1; }
+                }
+                /* outputs over a whole plane and over a band that starts inside it */
+                const int bands[2][2] = { { 0, H }, { H / 2, H } };
+                std::vector<int8_t> dsrc((size_t)C * H * W);
+                for (auto &b : dsrc) b = (int8_t)tr_next();
+                std::vector<int32_t> acc((size_t)C * H * W), Sx((size_t)H * W), eb(C);
+                std::vector<int> wzp(C);
+                std::vector<float> ws(C), fb(C);
+                std::vector<_Float16> fsrc((size_t)C * H * W);
+                for (auto &a : acc) a = (int32_t)(tr_next() % 60001) - 30000;
+                for (auto &x : Sx) x = (int32_t)(tr_next() % 4001) - 2000;
+                for (int c = 0; c < C; c++) {
+                    eb[c] = (int32_t)(tr_next() % 20001) - 10000; wzp[c] = 100 + (int)(tr_next() % 60);
+                    ws[c] = 0.0009f + (float)(tr_next() % 100) * 0.00003f; fb[c] = ((float)(tr_next() % 200) - 100.f) * 0.01f;
+                }
+                for (auto &f : fsrc) f = (_Float16)(((float)(tr_next() % 4001) - 2000.f) * 0.004f);
+                for (int bi = 0; bi < 2; bi++) {
+                    const int oh0 = bands[bi][0], oh1 = bands[bi][1];
+                    for (int u = 0; u < 2; u++) {
+                        const size_t n = (size_t)H * W * C;
+                        std::vector<unsigned char> g(n, 0x5A), r(n, 0x5A);
+                        const int amin = u ? 3 : -120, amax = u ? 250 : 117;
+                        rocket_out_dw_i8_to_nhwc_q_band(dsrc.data(), g.data(), C, H, W, u ? 128 : 0, amin, amax, oh0, oh1);
+                        ref_out_dw(dsrc.data(), r.data(), C, H, W, u ? 128 : 0, amin, amax, oh0, oh1);
+                        cases++;
+                        if (g != r) { printf("  out dw u=%d C=%d %dx%d band %d FAIL\n", u, C, H, W, bi); fail = 1; }
+                        std::fill(g.begin(), g.end(), 0x5A); std::fill(r.begin(), r.end(), 0x5A);
+                        if (u) rocket_out_nchw_to_nhwc_q_per_axis_u8_band(acc.data(), g.data(), C, H, W, eb.data(), wzp.data(), Sx.data(), act, 0.02f, ws.data(), 0.05f, 128, oh0, oh1);
+                        else   rocket_out_nchw_to_nhwc_q_per_axis_band(acc.data(), g.data(), 0, C, H, W, eb.data(), act, 0.02f, ws.data(), 0.05f, -3, oh0, oh1);
+                        ref_per_axis(acc.data(), r.data(), u, C, H, W, eb.data(), u ? wzp.data() : nullptr, u ? Sx.data() : nullptr, act, 0.02f, ws.data(), 0.05f, u ? 128 : -3, oh0, oh1);
+                        cases++;
+                        if (g != r) { printf("  out per-axis u=%d C=%d %dx%d band %d act %d FAIL\n", u, C, H, W, bi, act); fail = 1; }
+                        std::fill(g.begin(), g.end(), 0x5A); std::fill(r.begin(), r.end(), 0x5A);
+                        rocket_out_nchw_to_nhwc_q_band(fsrc.data(), g.data(), u, C, H, W, fb.data(), act, 0.03f, u ? 120 : 4, oh0, oh1);
+                        ref_out_fp16(fsrc.data(), r.data(), u, C, H, W, fb.data(), act, 0.03f, u ? 120 : 4, oh0, oh1);
+                        cases++;
+                        if (g != r) { printf("  out fp16 u=%d C=%d %dx%d band %d act %d FAIL\n", u, C, H, W, bi, act); fail = 1; }
+                    }
+                }
+            }
+    printf("%-26s %d cases against the per-channel loops -> %s\n", "transposed conversions", cases, fail ? "FAIL" : "PASS");
+    return fail;
+}
+
+/* ---- EVERY BYTE CODE through the table-driven quant unary and concat kernels ----
+ * rocket_unary_q and rocket_concat_in_q evaluate the 256 codes once and look the
+ * elements up; the cases above reach 21 or 3 codes around the zero point. This feeds all
+ * 256 codes (a non-periodic stride, n = 4099) for every quant kind at both signs and
+ * three quant pairs, and a concat input through a clamp, against the per-element oracle. */
+static int run_byte_tables(void) {
+    const int kinds[] = { ROCKET_UNARY_HARDSWISH, ROCKET_UNARY_SIGMOID, ROCKET_UNARY_HARDSIGMOID,
+                          ROCKET_UNARY_TANH, ROCKET_UNARY_ELU, ROCKET_UNARY_LOG, ROCKET_UNARY_RELU,
+                          ROCKET_UNARY_RELU6, ROCKET_UNARY_RELU_N1_1, ROCKET_UNARY_LEAKY_RELU,
+                          ROCKET_UNARY_EXP, ROCKET_UNARY_SQRT, ROCKET_UNARY_RSQRT, ROCKET_UNARY_ABS,
+                          ROCKET_UNARY_NEG, ROCKET_UNARY_SQUARE, ROCKET_UNARY_FLOOR };
+    struct QP { float in_s; int in_z; float out_s; int out_z; };
+    const QP qp[2][3] = {
+        { { .0625f, -3, .0625f, -3 }, { .1171875f, 17, 0.00390625f, -128 }, { .03f, -100, .07f, 40 } },
+        { { .0625f, 128, .0625f, 128 }, { .1171875f, 145, 0.00390625f, 0 }, { .03f, 28, .07f, 168 } },
+    };
+    const size_t n = 4099;
+    std::vector<unsigned char> in(n), got(n);
+    for (size_t i = 0; i < n; i++) in[i] = (unsigned char)((i * 167 + 13) & 255);
+    int fail = 0, cases = 0;
+    for (int u = 0; u < 2; u++)
+        for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++)
+            for (int p = 0; p < 3; p++) {
+                const QP &q = qp[u][p];
+                const float param = kinds[k] == ROCKET_UNARY_LEAKY_RELU ? 0.15f : 0.f;
+                rocket_unary_q(in.data(), got.data(), n, kinds[k], u, u,
+                               q.in_s, q.in_z, q.out_s, q.out_z, param);
+                const int qmin = u ? 0 : -128, qmax = u ? 255 : 127; const float inv = 1.f / q.out_s;
+                int md = 0;
+                for (size_t i = 0; i < n; i++) {
+                    float v = act_ref_f(kinds[k], q.in_s * (float)(rocket_qread(in.data(), i, u) - q.in_z), param);
+                    long r = (long)lrintf(v * inv) + q.out_z; if (r < qmin) r = qmin; if (r > qmax) r = qmax;
+                    md = std::max(md, abs(rocket_qread(got.data(), i, u) - (int)r));
+                }
+                cases++;
+                if (md) { printf("  unary kind %d %s qp %d: max|dq|=%d FAIL\n", kinds[k], u ? "u8" : "i8", p, md); fail = 1; }
+            }
+    /* concat: one input through each act at each quant pair, plus the identity copy */
+    const int acts[] = { ROCKET_ACT_NONE, ROCKET_ACT_RELU, ROCKET_ACT_RELU6, ROCKET_ACT_RELUN1 };
+    for (int u = 0; u < 2; u++)
+        for (size_t a = 0; a < sizeof(acts) / sizeof(acts[0]); a++)
+            for (int p = 0; p < 3; p++) {
+                const QP &q = qp[u][p];
+                /* output [1][7][n0][1] from two inputs along axis 1: in_axis 3 then 4 */
+                const int inner = 31, outer = 5, out_axis = 7;
+                std::vector<unsigned char> src((size_t)outer * 3 * inner), dst((size_t)outer * out_axis * inner, 0xA5);
+                for (size_t i = 0; i < src.size(); i++) src[i] = (unsigned char)((i * 89 + 7) & 255);
+                rocket_concat_in_q(src.data(), dst.data(), outer, 3, out_axis, inner, 2, acts[a], u, u,
+                                   q.in_s, q.in_z, q.out_s, q.out_z);
+                const int qmin = u ? 0 : -128, qmax = u ? 255 : 127; const float inv = 1.f / q.out_s;
+                int md = 0, stray = 0;
+                for (int o = 0; o < outer; o++)
+                    for (int j = 0; j < out_axis; j++)
+                        for (int c = 0; c < inner; c++) {
+                            const size_t di = ((size_t)o * out_axis + j) * inner + c;
+                            if (j < 2 || j >= 5) { stray |= dst[di] != 0xA5; continue; }
+                            const size_t si = ((size_t)o * 3 + (j - 2)) * inner + c;
+                            float v = rocket_apply_act(q.in_s * (float)(rocket_qread(src.data(), si, u) - q.in_z), acts[a]);
+                            long r = (long)lrintf(v * inv) + q.out_z; if (r < qmin) r = qmin; if (r > qmax) r = qmax;
+                            md = std::max(md, abs(rocket_qread(dst.data(), di, u) - (int)r));
+                        }
+                cases++;
+                if (md || stray) { printf("  concat act %d %s qp %d: max|dq|=%d stray=%d FAIL\n", acts[a], u ? "u8" : "i8", p, md, stray); fail = 1; }
+            }
+    printf("%-26s %d cases, all 256 codes -> %s\n", "byte tables (unary+concat)", cases, fail ? "FAIL" : "PASS");
+    return fail;
+}
+
 /* ---- FULLY_CONNECTED (float host kernel rocket_fc_f) ---- */
 struct FCT { int M, K, N, act, bias; const char *name; };
 static int run_fc(const FCT &s) {
@@ -1435,12 +1735,16 @@ static int run_pool(int fd, const PoolT &s) {
         // and AVERAGE only when VALID (the PPU divides by KH*KW; padded avg diverges from the
         // oracle's valid-count — MAX with pad is fine). Compared to the same independent oracle.
         if (fd >= 0 && (!s.is_avg || s.same == 0)) {
-            rocket_pool_desc d;
+            rocket_pool_desc d = {};   // avg_exclude_pad too: garbage made the plan refuse
             d.c = s.C; d.ih = s.IH; d.iw = s.IW; d.kh = s.KH; d.kw = s.KW;
             d.stride_y = s.sy; d.stride_x = s.sx;
             d.pad_top = pt; d.pad_left = pl; d.pad_bottom = tot_h - pt; d.pad_right = tot_w - pl;
             d.method = s.is_avg ? POOL_METHOD_AVG : POOL_METHOD_MAX;
-            if (rocket_pool_fp16_plan(&d) == 0) {
+            // Every shape that reaches here is one the plan takes, so a refusal fails the
+            // case rather than skipping the device half.
+            const int pr = rocket_pool_fp16_plan(&d);
+            if (pr != 0) { printf("  NPU PPU: rocket_pool_fp16_plan=%d -> FAIL\n", pr); fail = 1; }
+            else {
                 std::vector<_Float16> a((size_t)s.C * s.IH * s.IW), b((size_t)s.C * OH * OW);
                 for (int h = 0; h < s.IH; h++) for (int w = 0; w < s.IW; w++) for (int c = 0; c < s.C; c++)
                     a[((size_t)c * s.IH + h) * s.IW + w] = (_Float16)in[((size_t)h * s.IW + w) * s.C + c];
@@ -1906,6 +2210,77 @@ static int run_dw_i8_glue(int C, int IH, int IW, int KH, int KW, int in_zp,
     return fails ? 1 : 0;
 }
 
+/* ==========================================================================
+ * Native uint8 DEPTHWISE host glue, and the fused-activation clamp the native depthwise
+ * route applies after its on-chip requant:
+ *   rocket_dw_filter_u8_to_chw     — TFLite [1,KH,KW,C] uint8 -> [C,KH,KW] int8, minus 128
+ *   rocket_act_range_q             — TFLite's CalculateActivationRangeQuantized
+ *   rocket_out_dw_i8_to_nhwc_q_band — NCHW int8 -> NHWC bytes, + offset, clamped, by band
+ * Device-independent: each is checked against an exact integer reference.
+ * ========================================================================== */
+static int run_dw_u8_glue(void)
+{
+    printf("uint8 depthwise glue and the quantized activation clamp\n");
+    int fails = 0;
+
+    /* 1) filter reorder with the 128 recentering. */
+    const int C = 48, KH = 3, KW = 5;
+    std::vector<unsigned char> flt((size_t)KH * KW * C);
+    for (size_t i = 0; i < flt.size(); i++) flt[i] = (unsigned char)((i * 37 + 11) % 256);
+    std::vector<int8_t> chw((size_t)C * KH * KW);
+    rocket_dw_filter_u8_to_chw(flt.data(), chw.data(), C, KH, KW);
+    int md_f = 0;
+    for (int c = 0; c < C; c++)
+        for (int kh = 0; kh < KH; kh++)
+            for (int kw = 0; kw < KW; kw++) {
+                int got = chw[((size_t)c * KH + kh) * KW + kw];
+                int want = (int)flt[((size_t)kh * KW + kw) * C + c] - 128;
+                md_f = std::max(md_f, abs(got - want));
+            }
+    printf("  dw_filter_u8_to_chw  max|d|=%d -> %s\n", md_f, md_f == 0 ? "PASS" : "FAIL");
+    fails |= (md_f != 0);
+
+    /* 2) the activation range, against values worked by hand from TFLite's formula:
+     *    bound = zp + round(f / scale), half away from zero, held inside [qmin, qmax]. */
+    struct { int act; float s; int zp, qmin, qmax, lo, hi; const char *what; } A[] = {
+        { ROCKET_ACT_NONE,   0.02f,        10,    0, 255,   0, 255, "u8 none" },
+        { ROCKET_ACT_RELU,   0.02f,        10,    0, 255,  10, 255, "u8 relu zp 10" },
+        { ROCKET_ACT_RELU6,  6.f / 255.f,   0,    0, 255,   0, 255, "u8 relu6, range [0,6]" },
+        { ROCKET_ACT_RELU6,  0.05f,         3,    0, 255,   3, 123, "u8 relu6 inside the range" },
+        { ROCKET_ACT_RELU6,  0.8f,          0,    0, 255,   0,   8, "u8 relu6 at a half (7.5)" },
+        { ROCKET_ACT_RELUN1, 1.f / 64.f,   -5, -128, 127, -69,  59, "i8 relu_n1_to_1" },
+        { ROCKET_ACT_RELU6,  0.001f,        0, -128, 127,   0, 127, "i8 relu6 past qmax" },
+        { ROCKET_ACT_RELU,   0.1f,       -128, -128, 127, -128, 127, "i8 relu at qmin" },
+    };
+    for (const auto &a : A) {
+        int lo = 0, hi = 0;
+        rocket_act_range_q(a.act, a.s, a.zp, a.qmin, a.qmax, &lo, &hi);
+        const bool ok = lo == a.lo && hi == a.hi;
+        printf("  act_range_q %-26s [%d,%d] want [%d,%d] -> %s\n", a.what, lo, hi, a.lo, a.hi,
+               ok ? "PASS" : "FAIL");
+        fails |= !ok;
+    }
+
+    /* 3) the epilogue copy: offset and clamp, run as two bands that must cover the plane. */
+    const int OC = 40, OH = 7, OW = 6, off = 128, amin = 3, amax = 250;
+    std::vector<int8_t> src((size_t)OC * OH * OW);
+    for (size_t i = 0; i < src.size(); i++) src[i] = (int8_t)((int)((i * 29 + 3) % 256) - 128);
+    std::vector<unsigned char> dst((size_t)OH * OW * OC, 0xA5);
+    rocket_out_dw_i8_to_nhwc_q_band(src.data(), dst.data(), OC, OH, OW, off, amin, amax, 0, 3);
+    rocket_out_dw_i8_to_nhwc_q_band(src.data(), dst.data(), OC, OH, OW, off, amin, amax, 3, OH);
+    int md_o = 0;
+    for (int c = 0; c < OC; c++)
+        for (int y = 0; y < OH; y++)
+            for (int x = 0; x < OW; x++) {
+                int v = (int)src[((size_t)c * OH + y) * OW + x] + off;
+                v = v < amin ? amin : (v > amax ? amax : v);
+                md_o = std::max(md_o, abs((int)dst[((size_t)y * OW + x) * OC + c] - v));
+            }
+    printf("  out_dw_i8_to_nhwc_q  max|d|=%d -> %s\n", md_o, md_o == 0 ? "PASS" : "FAIL");
+    fails |= (md_o != 0);
+    return fails ? 1 : 0;
+}
+
 int main(void)
 {
     int fd = rocket_open();
@@ -2135,6 +2510,7 @@ int main(void)
     fail |= run_dw_i8_glue(32,  8, 8, 3,3,  -3, 1, 1, "glue C=32 3x3 SAME pad zp-3");  printf("\n");
     fail |= run_dw_i8_glue(64, 10, 6, 5,5,   0, 0, 0, "glue C=64 5x5 nopad zp0");      printf("\n");
     fail |= run_dw_i8_glue(16,  7, 9, 3,3, 128, 2, 1, "glue C=16 u8-domain zp128 pad"); printf("\n");
+    fail |= run_dw_u8_glue(); printf("\n");
 
     /* ---- resident-BO conv context: rocket_conv2d_fp16_ctx vs the per-call path ----
      * ONE ctx driven across the sequence below exercises pool reuse + growth
@@ -2214,6 +2590,9 @@ int main(void)
         { 8, 8,16, ROCKET_UNARY_FLOOR,       0, 0, 1.f,0,   1.f,0,   "floor float" },
     };
     for (size_t i = 0; i < sizeof(acts)/sizeof(acts[0]); i++) { fail |= run_act(acts[i]); printf("\n"); }
+    fail |= run_byte_tables(); printf("\n");
+    fail |= run_transposed_conversions(); printf("\n");
+    fail |= run_vector_host_ops(); printf("\n");
 
     const BinT bins[] = {
         /* H  W  C  op                q  au bu ou  in0(s,z)  in1(s,z)  out(s,z)  name */
