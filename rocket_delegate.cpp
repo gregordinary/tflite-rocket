@@ -131,9 +131,10 @@ struct RocketOptions {
                                 // requantized on chip, the weight zero point on CPEND, so no int32
                                 // readback, box-sum or host requant. Within one count of TFLite at
                                 // a rounding boundary (the OUT_CVT's 15-bit multiplier), where the
-                                // int32-raw route's host requant is TFLite's. MobileDet 1.21-1.22x
-                                // unpinned on ondemand, 1.23-1.25x pinned. direct_i8out=0 is the
-                                // A/B switch back to the int32-raw route.
+                                // int32-raw route's host requant is TFLite's. MobileDet 1.22-1.27x
+                                // pinned (four rotated passes) and 1.21-1.22x unpinned on ondemand
+                                // (RK1, 600 MHz, 2026-09-27). direct_i8out=0 is the A/B switch back
+                                // to the int32-raw route.
     bool direct_perc = true;    // under native_int8: a signed-int8 DIRECT conv with PER-AXIS weights
                                 // (TFLite's default conv quantization) that reaches the direct conv
                                 // runs the library's per-channel int8-out entry
@@ -626,10 +627,11 @@ static bool analyze_conv(const TfLiteRegistration *reg, const TfLiteNode *node,
                 for (int oc = 0; oc < OC; oc++) if (wz[oc] != 128) { sym128 = false; break; }
                 out->needs_boxsum = !sym128;
             }
-            // DEPTHWISE native (int8-out on-chip requant), int8 or uint8: PER-TENSOR quant only
-            // (the on-chip requant is one OUT_CVT scale; a per-channel DW stays on fp16). Any
-            // per-tensor weight zero point: the DPU's CPEND operand adds -w_zp times each
-            // window's input sum. A uint8 tensor is recentered by 128. The SAME pad is
+            // DEPTHWISE native (int8-out on-chip requant), int8 or uint8, PER-TENSOR quant (one
+            // OUT_CVT scale). A per-axis int8 DW takes the per-channel entry below under dw_perc,
+            // and stays on fp16 with dw_perc=0. Any per-tensor weight zero point: the DPU's
+            // CPEND operand adds -w_zp times each window's input sum. A uint8 tensor is
+            // recentered by 128. The SAME pad is
             // materialized on the host, so an odd total pad (a stride-2 layer on an even plane)
             // is taken too, and the library's planner decides the shape on the materialized
             // descriptor `d`, the one Eval programs.
@@ -1826,7 +1828,8 @@ static bool analyze_node(const TfLiteRegistration *reg, const TfLiteNode *node,
 }
 
 // Run fn(oh0,oh1) over the output rows [0,OH), fanned across up to `nthreads` big
-// cores (the native-conv requant — the delegate's largest host cost — splits by row).
+// cores (the native-conv requant splits by row; it was the delegate's largest host cost on
+// the 2026-06 build, and its share under the int8-out defaults is unmeasured).
 // `work` is the output element count (OH*OW*OC); below a floor the thread-spawn cost
 // would exceed the work, so it runs inline on the caller. Disjoint row bands => no
 // races and bit-identical to one pass (the band functions index by absolute oh). Every
@@ -2883,7 +2886,8 @@ private:
                             c.KH, c.KW, c.sy, c.sx);
                 return kTfLiteError;
             }
-            // requant is the single largest host cost -> fan across the big cores by row band.
+            // requant was the largest host cost on the 2026-06 build (unmeasured under the
+            // int8-out defaults) -> fan across the big cores by row band.
             parallel_oh(OH, (size_t)OH * OW * OC, opts_.nthreads, [&](int oh0, int oh1) {
                 rocket_out_nchw_to_nhwc_q_per_axis_u8_band(out_nchw.data(), out_q, OC, OH, OW,
                         c.eff_bias.empty() ? nullptr : c.eff_bias.data(),

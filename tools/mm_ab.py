@@ -5,9 +5,12 @@
 Two checks:
   1. ACCURACY vs CPU TFLite (the ground truth): runs the delegate with the 1x1 convs on
      the resident int8 matmul (mm_int8=1) vs the native conv pool (mm_int8=0), and reports
-     each one's max/mean |delegate - CPU| per output. Both the matmul and the conv path are
-     bit-exact to the int64 reference (tests/mm_vs_conv_acc.c), so mm_int8=1 and mm_int8=0
-     both match CPU, and on matmul-eligible shapes (M%4||M==1) the two agree byte-for-byte.
+     each one's max/mean |delegate - CPU| per output. Both arms pin direct_i8out=0,
+     direct_perc=0 and pw_i8out_min_m=0, so every direct and 1x1 conv takes the int32 route
+     and its host requant rather than the int8-out writer, which lands within one count.
+     Both the matmul and the conv path are bit-exact to the int64 reference
+     (tests/mm_vs_conv_acc.c), so on matmul-eligible shapes (M%4||M==1) the two arms agree
+     byte-for-byte. The depthwise layers take the same route in both arms.
   2. nthreads=1 vs N (mm_int8=1) BYTE-IDENTICAL: the matmul is worker-count independent.
 
 Usage: mm_ab.py <model.tflite> <delegate.so> [--nthreads N]
@@ -58,7 +61,8 @@ def main():
                              else rng.integers(np.iinfo(dt).min, np.iinfo(dt).max + 1,
                                                size=d["shape"], dtype=dt))
     so = args.delegate
-    base_opt = {"__so__": so, "native_int8": "1", "nthreads": args.nthreads}
+    base_opt = {"__so__": so, "native_int8": "1", "nthreads": args.nthreads,
+                "direct_i8out": "0", "direct_perc": "0", "pw_i8out_min_m": "0"}
     cpu = run(Interp, ndr, args.model, feeds)                                   # CPU TFLite ref
     on  = run(Interp, ndr, args.model, feeds, load_delegate, {**base_opt, "mm_int8": "1"})
     off = run(Interp, ndr, args.model, feeds, load_delegate, {**base_opt, "mm_int8": "0"})

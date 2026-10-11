@@ -9,14 +9,14 @@ frequency.
 
 ## About tflite-rocket
 
-A TensorFlow Lite external delegate for Rockchip NPUs (validated on the RK3588) via the mainline
-`rocket` DRM-accel driver, and the detection frontend of the stack. It offloads supported TFLite
-ops to the NPU through the standalone `rocket-userspace` driver library. Everything else falls back
-to the CPU, exactly like ggml's scheduler.
+A TensorFlow Lite external delegate for Rockchip NPUs (validated on the RK3588 and the RK3576) via
+the mainline `rocket` DRM-accel driver, and the detection frontend of the stack. It offloads
+supported TFLite ops to the NPU through the standalone `rocket-userspace` driver library.
+Everything else falls back to the CPU, exactly like ggml's scheduler.
 
 Any TFLite-based application can load it at runtime and run an unmodified `.tflite` model. The
-motivating use case is real-time detection, for example Frigate, on mainline RK3588, *without* the
-proprietary RKNN toolkit.
+motivating use case is real-time detection, for example Frigate, on a mainline RK3588 or RK3576,
+*without* the proprietary RKNN toolkit.
 
 It links the standalone `librocketnpu` driver library (the `rocket-userspace` project) and plugs into
 the TensorFlow Lite runtime.
@@ -36,10 +36,17 @@ partition is therefore NPU-resident.
 
 The 1×1 pointwise fast path uses the resident prepacked matmul. The general, strided, stem and
 depthwise convs use the HW-validated `rocket_conv2d_fp16`. int8/uint8 has two paths: the default
-dequant↔fp16 boundary (an
-fp16 approximation) and the opt-in `native_int8=1` path, a real int8xint8->int32 conv with host
-requant and exact int8/uint8 semantics. The complete op mapping, the quantization internals, the
-delegate-option reference, and the host-side/gaps analysis are in [API.md](API.md).
+dequant↔fp16 boundary (an fp16 approximation) and the opt-in `native_int8=1` path, an
+int8xint8->int32 conv that accumulates exactly on the NPU.
+
+Under `native_int8=1`, the default-on `direct_i8out`, `direct_perc` and `pw_i8out_min_m` routes
+requantize direct convs and large-plane 1×1s on chip. They differ from TFLite by one count on
+0.037-0.156% of the outputs they write, never by more [HW sweep]. With `direct_i8out=0` and
+`direct_perc=0`, those convs take the int32 route, whose host requant is TFLite's exactly. A
+depthwise layer on the native path requantizes on chip either way, within one count.
+
+The complete op mapping, the quantization internals, the delegate-option reference, and the
+host-side/gaps analysis are in [API.md](API.md).
 
 ## Architecture
 
@@ -128,8 +135,8 @@ even, where TFLite carries 31 bits and rounds half away from zero. The disagreem
 a chain, because layer *n*+1 is fed the part's output rather than TFLite's.
 
 Both detectors score at **CPU parity**. mAP@[.5:.95] over 500 COCO val2017 images is 0.2617
-against 0.2631 for SSD-MobileNetV2, and 0.2809 against 0.2823 for EfficientDet-Lite0, **-0.0014
-each** (`tools/coco_map.py`).
+against 0.2631 for SSD-MobileNetV2, **-0.0014**, and 0.2818 against 0.2823 for
+EfficientDet-Lite0, **-0.0005** (`tools/coco_map.py`).
 
 That is the comparison a detector admits. Its output list is NMS-ordered, and one count of
 arithmetic drift reorders or drops a box, which makes an element-wise diff against the CPU
@@ -169,27 +176,31 @@ See
 
 ## Performance
 
-Warm, RK3588 @ 600 MHz, `native_int8=1` (the exact-int8 path, opt-in for the delegate and the
-default in the Frigate `rocket.py` plugin). At a glance:
+Warm, RK3588 @ 600 MHz, `native_int8=1` (opt-in for the delegate and the default in the Frigate
+`rocket.py` plugin). At a glance:
 
-| Metric | Result |
-|---|---|
-| COCO-val mAP@[.5:.95] | 0.3321 NPU vs 0.3318 CPU int8 (parity, 500 images) |
-| Warm single-stream latency, MobileDet | ~56 ms, governor pinned to `performance`, on the A76 cores; ~76 ms on the default `ondemand` governor |
-| Multi-camera pool, P=1->4 | 3.20 -> 9.55 detection_fps (2.98x at P=4, live Frigate) |
+| Metric | Result | Measured |
+|---|---|---|
+| Warm single-stream latency, MobileDet | ~56 ms, governor pinned to `performance`, on the A76 cores; ~76 ms on the default `ondemand` governor | 2026-09-28, current defaults |
+| COCO-val mAP@[.5:.95], MobileDet | 0.4040 NPU vs 0.3980 CPU int8 (100 images) | 2026-09-28, current defaults |
+| COCO-val mAP@[.5:.95], MobileDet | 0.3321 NPU vs 0.3318 CPU int8 (parity, 500 images) | 2026-06-21, with the host requant on every conv |
+| Multi-camera pool, P=1->4 | 3.20 -> 9.55 detection_fps (2.98x at P=4, live Frigate) | 2026-07-01, at a ~336 ms single stream |
 
-The latency figures were measured on an RK1 at 600 MHz on 2026-09-28. The `ondemand` governor
-parks the cores that an offloading process leaves idle, which costs MobileDet 1.36x here, on a
-board whose A76 floor is 1.2 GHz.
+The latency figures were measured on an RK1 at 600 MHz. The `ondemand` governor parks the cores
+that an offloading process leaves idle, which costs MobileDet 1.36x here, on a board whose A76
+floor is 1.2 GHz. The 500-image mAP and the pool predate the current defaults and have not been
+re-measured on them.
 For latency, pin the big cores' governor to `performance`. The NPU's larger value is still
 throughput under a multi-camera pool (Frigate's regime). The levers behind the single-stream
 figure (on MobileDet / MobileNetV2):
 
-- **Resident device state.** Packing weights once in `Prepare` and reusing a resident 5-BO conv pool
-  (`rocket_conv_ctx`) across calls/tiles removes the dominant per-op cost. Warm MobileNetV2 block
-  ~28->12 ms (~3x), numerics bit-identical.
+- **Resident device state.** Packing weights once in `Prepare` and reusing a resident conv BO pool
+  (`rocket_conv_ctx`) across calls/tiles removes the dominant per-op cost. The pool keeps an IOVA
+  guard plus input, weight, regcmd, output and bias BOs, each role cached by power-of-two size
+  class. Warm MobileNetV2 block ~28->12 ms (~3x) on a June 2026 build, numerics bit-identical.
 - **Multicore DIRECT conv** (`rocket_conv_pool` + `rocket_conv2d_int8_mt`) fans the conv's independent
-  OC/OH/OW tiles across the 3 NPU cores, bit-exact. Warm MobileDet 560->458 ms (1.21x).
+  OC/OH/OW tiles across the 3 NPU cores, bit-exact. Warm MobileDet 560->458 ms (1.21x) on a June
+  2026 build.
 - **1×1 int8/uint8 -> resident matmul** (`mm_int8`, default-on under `native_int8`): a 1×1 conv is a
   matmul, so routing it to `rocket_matmul_int8_prepacked` is +8% warm (366->336 ms), bit-exact.
 - **uint8 depthwise -> on-chip requant** (under `native_int8`): a per-tensor depthwise, int8 or
@@ -229,9 +240,9 @@ figure (on MobileDet / MobileNetV2):
   the fp16 route's 0.2998 and the CPU's 0.2996.
 - **uint8 direct convs -> the int8-out writer** (`direct_i8out`, default-on under `native_int8`):
   a uint8 direct conv with per-tensor weights is requantized on chip. The weight zero point rides
-  the DPU's CPEND operand, so there is no int32 readback, box-sum or host requant. Pinned,
-  MobileDet runs 1.23-1.25x (93 -> 75 ms) and SSD MobileNet v2 1.19x. Unpinned on `ondemand` they
-  run 1.21-1.22x and 1.17x. COCO mAP over 100 images moves 0.3990 -> 0.3994 and 0.3197 -> 0.3213.
+  the DPU's CPEND operand, so there is no int32 readback, box-sum or host requant. Pinned, over
+  four rotated passes, MobileDet runs 1.22-1.27x (93 -> 75 ms) and SSD MobileNet v2 1.19-1.20x.
+  Unpinned on `ondemand` they run 1.21-1.22x and 1.17x. COCO mAP over 100 images moves 0.3990 -> 0.3994 and 0.3197 -> 0.3213.
   Outputs move by at most one count, on 0.037% of MobileDet's direct-conv elements.
 - **Large-plane 1×1s -> the int8-out writer** (`pw_i8out_min_m`, 256 by default under
   `native_int8`): a 1×1 at 16×16 and up runs the direct int8-out program. The int8 matmul's
@@ -247,30 +258,33 @@ figure (on MobileDet / MobileNetV2):
   mAP over 100 images moves 0.3019 -> 0.3023 (CPU 0.2996). Outputs move by at most one
   count, on 0.16% of the conv outputs.
 - **COCO-val mAP: CPU parity.** MobileDet mAP@[.5:.95] = 0.3321 vs CPU 0.3318 (Δ +0.0002, 500 val
-  images, `tools/coco_map.py`).
+  images, `tools/coco_map.py`), measured 2026-06-21 with the host requant on every conv.
 
 Throughput comes from running several detection contexts concurrently, one process per stream
 (exactly how Frigate runs cameras), each pinned to a distinct A76 core via `ROCKET_CPU_AFFINITY`. The
 host-requant NEON vectorization, the multi-camera throughput recipe, and the op-coverage gaps are
 detailed in [API.md](API.md#host-side-work-and-remaining-gaps).
 
-**Do not leave the CPU cores free to park.** The inference is host cube-gather-bound and the
-process blocks while the NPU runs. A load-sampling CPU governor therefore reads the cores as idle
-and drops them toward `scaling_min_freq`. The host half of the next inference then runs at that
-floor.
+**Do not leave the CPU cores free to park.** The process blocks while the NPU runs. A
+load-sampling CPU governor therefore reads the cores as idle and drops them toward
+`scaling_min_freq`. The host half of the next inference then runs at that floor.
 
-The same MobileDet run measures 199.7 ms with the big cores pinned and **639.4 ms** under
-`ondemand`, on a board whose A76 floor is 408 MHz. That is 1.27x rather than 3.2x where the floor
-is 1.2 GHz. Plain-CPU TFLite on the same board is flat at 183 ms in both.
+The current build pays the 1.36x above on a board whose A76 floor is 1.2 GHz. The 2026-08-25
+build, at ~199 ms with the governor pinned, paid 1.27x on such a board. On a vendor-kernel board
+whose A76 floor is 408 MHz, that build measured 199.7 ms pinned and **639.4 ms** under
+`ondemand`, 3.2x. Plain-CPU TFLite on that board was flat at 183 ms in both. The 408 MHz board has
+not been measured on the current build.
 
 A deployment needs the floor raised rather than `performance` everywhere. A benchmark needs the
 governor pinned before any number is quoted.
 
 ## Build
 
-**Prerequisites.** An RK3588 board on a mainline kernel carrying the `rocket` DRM-accel driver,
-with `/dev/accel/accel0` present (`lsmod | grep rocket`). Build and install the sibling
-`rocket-userspace` driver first, since the delegate links it, and see the reinstall note below:
+**Prerequisites.** An RK3588 or RK3576 board on a mainline kernel carrying the `rocket`
+DRM-accel driver, with `/dev/accel/accel0` present (`lsmod | grep rocket`). On the RK3576 the
+driver must carry that part's support (device-tree compatible `rockchip,rk3576-rknn-core`), so
+the node appears only once it binds. Build and install the sibling `rocket-userspace` driver
+first, since the delegate links it, and see the reinstall note below:
 
 ```sh
 cd ../rocket-userspace && cmake -S . -B build && cmake --build build && sudo cmake --install build
@@ -278,8 +292,8 @@ cd ../rocket-userspace && cmake -S . -B build && cmake --build build && sudo cma
 
 Bring your own
 `.tflite` detector (e.g. `ssdlite_mobiledet_coco_qat_postprocess.tflite` from the Coral / MediaPipe
-model zoo). The NPU boots at 200 MHz and the delegate is correct there, and the figures above are
-at 600 MHz. Apply the `patches/rocket` clock patch and load the module with
+model zoo). The RK3588's NPU boots at 200 MHz and the delegate is correct there, and the RK3588
+figures above are at 600 MHz. Apply the `patches/rocket` clock patch and load the module with
 `rocket_npu_clk_hz=600000000`.
 
 The delegate is a classic C `TfLiteDelegate` (it does not use the C++ `SimpleDelegate` helper), so it
@@ -340,13 +354,13 @@ cmake --build build -j -t convert_test
 ./build/convert_test                         # conv glue + aux ops, all max_abs=0 / max|dq|=0
 ```
 
-`convert_test` covers two groups against independent NHWC oracles. The conv glue is 11 float and 8
-quant `CONV_2D` shapes, plus 7 float and 4 int8/uint8 `DEPTHWISE_CONV_2D` shapes. The aux host ops
-are `ADD`, `AVERAGE_POOL_2D`, `MAX_POOL_2D`, `CONCATENATION` and `RESHAPE`, float and int8/uint8.
+`convert_test` covers two groups against independent NHWC oracles. The conv glue is 13 float and 9
+quant `CONV_2D` shapes, plus 11 float and 7 int8/uint8 `DEPTHWISE_CONV_2D` shapes. The native int8
+and uint8 direct convs add 11 and 13 shapes. The host-op group covers every op `aux_ops` claims
+and the `FULLY_CONNECTED` host matmul, float and int8/uint8 where the op takes both.
 
-The conv shapes also run on the NPU when one is present, which is the HW gate. The aux ops are pure
-host kernels, and their proof is
-device-independent).
+The conv shapes also run on the NPU when one is present, which is the HW gate. The host ops are
+pure host kernels, and their proof is device-independent.
 
 The full external-delegate option reference (`native_int8` / `mm_int8` / `nthreads` / `aux_ops` / the
 `*_npu` routes / `nchw_resident` / …) and the `ROCKET_PROF_POOL` probe are in
@@ -367,29 +381,39 @@ cmake -S . -B build -DTFLITE_DIR=/path/to/tflite-c-headers \
       -DROCKETNPU_PROVIDER_LIB=/path/to/build-rknpu/librknpu-submit.a
 ```
 
-The two paths are measured to agree. One RK3588, the same sources, clock-matched at 600 MHz: an
-MD5 over every output tensor of SSDLite-MobileDet and EfficientDet-Lite0 is identical on the two
-drivers.
+The two paths agreed in a 2026-08-26 measurement, on the delegate as built that day. It ran on
+two RK3588 boards, one per driver, built from the same sources and clock-matched at 600 MHz. An
+MD5 over every output tensor of SSDLite-MobileDet and EfficientDet-Lite0 was identical on the
+two drivers.
 
-That holds in the CPU, `native_int8=1` and `native_int8=0` arms, with every `*_npu` route enabled
-and on the `nchw_resident` path. `convert_test` and the six driver-level probes under `tests/` pass
-on both.
+That held in the CPU, `native_int8=1` and `native_int8=0` arms, with every `*_npu` route enabled
+and on the `nchw_resident` path. `convert_test` and the six driver-level probes under `tests/`
+passed on both.
 
-Warm single-inference latency is within 2%: MobileDet 202.1 ms against 197.9, and
-EfficientDet-Lite0 299.6 against 293.6. The workload is host-bound enough that the two boards' own
-CPU ceilings account for it. A four-process pool aggregates 3.51x against 3.61x
-with every process returning the single-process output hash.
+Warm single-inference latency was within 2%: MobileDet 202.1 ms against 197.9, and
+EfficientDet-Lite0 299.6 against 293.6. The workload was host-bound enough that the two boards'
+own CPU ceilings account for it. A four-process pool aggregated 3.51x against 3.61x with every
+process returning the single-process output hash.
+
+That build predates the on-chip requant routes that `native_int8` takes by default
+(`direct_i8out`, `direct_perc`, `pw_i8out_min_m`, `dw_perc` and the uint8 depthwise). Those
+routes have not run on the BSP driver at the delegate level.
 
 ## The rocket NPU stack
 
-This delegate is one frontend of an open source stack for Rockchip NPUs, three userspace projects
-plus a set of optional kernel patches:
+This delegate is one frontend of an open source stack for Rockchip NPUs. The stack is a driver
+library, three frontends, a submit provider for the vendor kernel, and a set of optional kernel
+patches:
 
 - **[`rocket-userspace`](https://github.com/gregordinary/rocket-userspace)** (`librocketnpu`): the
   userspace driver, matmul, and on-NPU op library. It is the dependency, and usable on its own.
 - **`tflite-rocket`** (this project): a TFLite external delegate for detection models.
 - **[`ggml-rocket`](https://github.com/gregordinary/ggml-rocket)**: a ggml backend `.so` for
   `llama.cpp` and `whisper.cpp`, linking the same driver.
+- **[`ort-rocket`](https://github.com/gregordinary/ort-rocket)**: an ONNX Runtime execution
+  provider for transformer encoders and per-layer convolutions, linking the same driver.
+- **[`rknpu-submit`](https://github.com/gregordinary/rknpu-submit)**: a submit provider that runs
+  `librocketnpu` on the vendor `rknpu` BSP kernel driver instead of mainline `rocket`.
 - **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope): optional out-of-tree
   kernel-module patches for clock, voltage and IOMMU. They raise the NPU clock from its 200 MHz
   boot default to 600 MHz, and the performance figures here assume them.

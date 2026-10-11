@@ -38,8 +38,9 @@ that one file, plus the device node and the host `render` group. No libdrm, no e
 runtime.
 
 **Model.** SSDLite-MobileDet (uint8, 320×320), Frigate's default CPU SSD model. On
-the NPU it runs at COCO mAP parity with the CPU TFLite reference (0.3321 vs 0.3318
-over 500 val2017 images), so detections match what the `cpu` detector would produce.
+the NPU it scores at CPU parity on COCO mAP@[.5:.95]: 0.3321 against the CPU TFLite
+reference's 0.3318 over 500 val2017 images, measured 2026-06-21. The delegate's current
+defaults read 0.4040 against 0.3980 over 100 images (2026-09-28).
 
 ## Build and run
 
@@ -58,7 +59,7 @@ build option internalizes them so the `.so` floors at glibc 2.34 and loads on bo
 
 ```bash
 # 1. Build the delegate + the C-API shim on the RK3588 host, portable to the image's
-#    glibc. (Driver already built+installed per ../README.md: librk3588npu at /usr/local.)
+#    glibc. (Driver already built+installed per ../README.md: librocketnpu at /usr/local.)
 cmake -S .. -B ../build -DTFLITE_DIR=/path/to/tflite/headers \
       -DTFLITE_ROCKET_PORTABLE_GLIBC=ON
 cmake --build ../build -j -t tflite_rocket tflite_cshim
@@ -132,8 +133,9 @@ detectors:
   rocket3: { type: rocket, num_threads: 1, device: "7" }
 ```
 
-Measured live on the RK3588 at 600 MHz, with NPU IRQs pinned to the big cores and a
-pool of `rocket0..rocket3` detectors serving four cameras:
+Measured live on 2026-07-01, on an RK3588 at 600 MHz whose single inference then took
+~336 ms. NPU IRQs were pinned to the big cores, and a pool of `rocket0..rocket3`
+detectors served four cameras:
 
 | Detectors | Aggregate `detection_fps` | Scaling |
 |---:|---:|---:|
@@ -146,19 +148,22 @@ Each detector lands on its own A76. The four big cores run ~73 % busy while the 
 handle video decode.
 
 A delegate-level submit-bound unit (`../tools/pool_throughput.py`) scales further, to
-1.00x / 2.17x / 3.11x / 3.56x. The live pool tapers below that ceiling, because a real
-MobileDet inference is host cube-scatter-and-gather-bound rather than submit-bound.
-Per-inference latency therefore rises from 338 to 424 ms as the four contexts contend
-for DRAM bandwidth. For the best result pin the
-NPU IRQs to the big cores (`tools/npu_set_irq_affinity.sh throughput` in the driver repo).
-Frigate's System-page `inference_speed` ~250 ms is its own per-invoke timer, a narrower span
-than the ~336-338 ms full single-stream inference measured here.
+1.00x / 2.17x / 3.11x / 3.56x. On that build the live pool tapered below that ceiling,
+because the inference was host cube-scatter-and-gather-bound rather than submit-bound.
+Per-inference latency rose from 338 to 424 ms as the four contexts contended for DRAM
+bandwidth. The pool has not been re-measured at the delegate's current ~56 ms single
+stream. For the best result pin the NPU IRQs to the big cores
+(`tools/npu_set_irq_affinity.sh throughput` in the driver repo).
+
+Frigate's System-page `inference_speed` read ~250 ms on that build. It is Frigate's own
+per-invoke timer, a narrower span than the ~336-338 ms full single-stream inference.
 
 ## Using a real camera
 
 This deployment runs unchanged against live RTSP cameras, and only the `cameras` block
-changes. The rocket detector has been run end to end on live cameras. It detects
-`person` and `car` on the NPU at the same `inference_speed ~250 ms` as the sample clip.
+changes. The rocket detector has been run end to end on live cameras. On 2026-07-01 it
+detected `person` and `car` on the NPU at the same `inference_speed` as the sample clip,
+~250 ms on that build.
 
 Replace the sample `cameras` block (and drop its `motion:` override, since a real camera
 calibrates on its own still periods) with your camera, restreamed through go2rtc. The
@@ -221,7 +226,8 @@ The clip needs a few still seconds first, then movement, which is what
 `make-sample-clip.sh` produces. A real camera gets still periods naturally.
 
 Check progress with `docker exec frigate curl -s localhost:5000/api/stats`. The `rocket`
-detector's `inference_speed` is ~250 ms when it is running on the NPU.
+detector reports a nonzero `inference_speed` once it runs on the NPU. That read ~250 ms on
+the 2026-07-01 build, the last one measured in Frigate.
 
 ### A live camera runs the detector but logs no events for long stretches
 
