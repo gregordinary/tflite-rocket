@@ -11,6 +11,13 @@
 #include <arm_neon.h>            /* NEON box-sum (rocket_in_window_sum_i8_band) */
 #endif
 
+/* A boolean environment switch: set, non-empty and not "0". */
+static inline int rocket_env_on(const char *name)
+{
+    const char *e = getenv(name);
+    return e && *e && *e != '0';
+}
+
 /*
  * rocket_convert.h — pure layout/padding/activation glue between TFLite's
  * NHWC float CONV_2D tensors and the rocket-userspace driver's NCHW fp16 conv.
@@ -805,7 +812,7 @@ static inline void rocket_out_nchw_to_nhwc_q_per_axis_band(
      * plane and the 4 results scatter out one byte each. int32 acc + a single scale mul +
      * vcvtnq (= lrintf RNE) => bit-identical to the scalar tail (same as the M-major path). */
     static int scalar_only = -1;   /* ROCKET_REQUANT_SCALAR=1 forces scalar (A/B + fallback) */
-    if (scalar_only < 0) scalar_only = (getenv("ROCKET_REQUANT_SCALAR") != NULL);
+    if (scalar_only < 0) scalar_only = rocket_env_on("ROCKET_REQUANT_SCALAR");
     const int32x4_t vlo = vdupq_n_s32(qmin), vhi = vdupq_n_s32(qmax), vzp = vdupq_n_s32(out_zp);
     const float32x4_t vinv = vdupq_n_f32(inv);
 #endif
@@ -972,13 +979,15 @@ static inline void rocket_in_window_sum_i8_band(
         boxsum_mode = e ? atoi(e) : 0;
     }
     if (boxsum_mode != 2 && sx == 1 && dx == 1) {
-        if (boxsum_mode == 0 && KW > 1) {
-            /* T spans the input columns the windows touch: ow in [0,OW), kw in [0,KW),
-             * tap = ow + kw, so the max index is (OW-1)+(KW-1) => OW+KW-1 columns. */
-            const int Tcols = OW + KW - 1;
-            int32_t Tstack[1024];
-            int32_t *T = (Tcols <= 1024) ? Tstack
-                                         : (int32_t *)malloc((size_t)Tcols * sizeof(int32_t));
+        /* T spans the input columns the windows touch: ow in [0,OW), kw in [0,KW),
+         * tap = ow + kw, so the max index is (OW-1)+(KW-1) => OW+KW-1 columns. A failed
+         * allocation leaves T NULL and takes the per-window form below, bit-identical. */
+        const int Tcols = OW + KW - 1;
+        int32_t Tstack[1024];
+        int32_t *T = NULL;
+        if (boxsum_mode == 0 && KW > 1)
+            T = (Tcols <= 1024) ? Tstack : (int32_t *)malloc((size_t)Tcols * sizeof(int32_t));
+        if (T) {
             for (int oh = oh0; oh < oh1; oh++) {
                 int32_t *srow = Sx + (size_t)oh * OW;
                 /* (1) channel + kernel-height reduce into T over the contiguous input columns */
@@ -1099,7 +1108,7 @@ static inline void rocket_out_nchw_to_nhwc_q_per_axis_u8_band(
      * the same bound the M-major u8 path relies on), so the int32 NEON arithmetic equals the
      * scalar `long` math and the result is byte-identical to the scalar tail below. */
     static int scalar_only = -1;   /* ROCKET_REQUANT_SCALAR=1 forces scalar (A/B + fallback) */
-    if (scalar_only < 0) scalar_only = (getenv("ROCKET_REQUANT_SCALAR") != NULL);
+    if (scalar_only < 0) scalar_only = rocket_env_on("ROCKET_REQUANT_SCALAR");
     const int32x4_t vzp = vdupq_n_s32(out_zp), vlo = vdupq_n_s32(0), vhi = vdupq_n_s32(255);
     const float32x4_t vinv = vdupq_n_f32(inv);
 #endif
@@ -1226,7 +1235,7 @@ static inline void rocket_out_mn_to_nhwc_q_per_axis_band(
     const int has_eb = eff_bias != NULL;
 #if defined(__ARM_NEON)   /* OC contiguous both sides; same bit-exact NEON requant as the u8 path */
     static int scalar_only = -1;
-    if (scalar_only < 0) scalar_only = (getenv("ROCKET_REQUANT_SCALAR") != NULL);
+    if (scalar_only < 0) scalar_only = rocket_env_on("ROCKET_REQUANT_SCALAR");
     const int32x4_t vlo = vdupq_n_s32(qmin), vhi = vdupq_n_s32(qmax), vzp = vdupq_n_s32(out_zp);
     const float32x4_t vis = vdupq_n_f32(in_scale), vinv = vdupq_n_f32(inv);
 #endif
@@ -1298,7 +1307,7 @@ static inline void rocket_out_mn_to_nhwc_q_per_axis_u8_band(
     const int has_beta = Sx != NULL && w_zp != NULL;   /* beta=128-w_zp only contributes here */
 #if defined(__ARM_NEON)
     static int scalar_only = -1;   /* ROCKET_REQUANT_SCALAR=1 forces the scalar path (A/B + fallback) */
-    if (scalar_only < 0) scalar_only = (getenv("ROCKET_REQUANT_SCALAR") != NULL);
+    if (scalar_only < 0) scalar_only = rocket_env_on("ROCKET_REQUANT_SCALAR");
 #endif
     for (int m = m0; m < m1; m++) {
         const int32_t *sp = src + (size_t)m * Ncol;

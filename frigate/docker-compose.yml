@@ -21,7 +21,7 @@ services:
       - /dev/accel/accel0:/dev/accel/accel0 # the RK3588 NPU
       - /dev/dri:/dev/dri # rkmpp hardware video decode (real cameras)
     group_add:
-      - "988" # host 'render' gid that owns /dev/accel0 — confirm with `getent group render`
+      - "988" # host 'render' gid that owns /dev/accel/accel0: confirm with `getent group render`
     volumes:
       - ./config.yml:/config/config.yml:ro
       - ./media:/media/frigate

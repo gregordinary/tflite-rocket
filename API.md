@@ -1,227 +1,339 @@
 # tflite-rocket: API and tuning reference
 
-The full TFLite op mapping, the quantization internals (native int8/uint8, the
-`nchw_resident` inter-op-buffer lever), the complete external-delegate option reference,
-and the host-side work and remaining-gaps analysis. The [README](README.md) is the guide,
-and this is the reference.
+The reference for tuning the delegate and checking what it does. It covers the recommended
+configuration, the op-by-op mapping, the quantized convolution routes and the RK3576 lowering. It
+also covers every option and environment variable, the delegate counts, multi-camera throughput
+and the host-side work. The [README](README.md) covers what the delegate is, the build and a
+first run, and its [Terms](README.md#terms) define the words this page uses.
+
+## Recommended configuration
+
+For a detector, as in Frigate:
+
+- **`native_int8=1`** runs the quantized convolutions on the [native int8 routes](#native-int8-routes),
+  and is the default in the Frigate plugin, `rocket.py`. Under its default routes, MobileDet's
+  COCO mAP@[.5:.95] over 500 images is 0.3325 against the CPU interpreter's 0.3301
+  [HW sweep 2026-10-29]. Under it, the default `mm_int8=1` sends each aligned 1×1 convolution to
+  the resident int8 matmul. The exception is a 1×1 that an int8-out route takes at
+  `pw_i8out_min_m` pixels or more.
+- **`aux_ops=1`**, the default, claims the ops between the convolutions and computes them with
+  host kernels, so the partitions stay contiguous. The opt-in on-NPU routes for those ops
+  (`act_npu`, `pool_npu` and the rest) are for comparison and fusion, because the host kernels
+  are exact and add no NPU round trip.
+- **A process pool** gives throughput: one delegate process per camera, each pinned to its own
+  Cortex-A76 core with `ROCKET_CPU_AFFINITY` ([Multi-camera throughput](#multi-camera-throughput)).
+  `nthreads`, default 4, spreads one convolution across the three NPU cores. The pool across
+  streams gives more.
+- **A raised `scaling_min_freq`** on the cores the detector runs on. The inference blocks while
+  the NPU runs, so a load-sampling governor reads the cores as idle and lowers them. The host
+  half of the next inference then runs at `scaling_min_freq`. Raising it on those cores is
+  enough, and `performance` everywhere is not needed. Pin the governor before quoting any
+  NPU-against-CPU figure.
+
+At a `scaling_min_freq` of 1.2 GHz, MobileDet runs 51.4 ms with the governor pinned and 73.5 ms on
+`ondemand`, 1.43x, at 928 MHz (the 900 MHz request) [HW sweep 2026-10-29]. At the same minimum, a
+2026-09-28 build at ~816 MHz measured 55.7 and 75.8 ms, 1.36x, and a 2026-08-25 build at ~199 ms
+measured 1.27x. On a BSP-kernel board whose `scaling_min_freq` is 408 MHz, that build measured 199.7
+ms pinned and 639.4 ms on `ondemand`, 3.2x. The CPU interpreter measured 183 ms under both.
+
+**Not characterized:** the 408 MHz board on the current build.
 
 ## TFLite op mapping
 
-| TFLite op | NPU path | status |
+The table is the RK3588's, where the delegate runs one op at a time. On an RK3576 the delegate
+claims the [RK3576 graph's](#the-rk3576-graph) op set instead. Every op not listed is declined
+and runs on the interpreter's CPU kernels.
+
+| TFLite op | Route | Status |
 |---|---|---|
-| `CONV_2D`, 1×1, stride 1 (**pointwise**), matmul-aligned | **the resident matmul** (`rocket_matmul_fp16_prepacked`, weights packed once at Prepare, `nthreads` workers) | wired |
-| `CONV_2D`, KxK / stride / `SAME`\|`VALID` pad / dilation (float) | fp16 conv (`rocket_conv2d_fp16`) | wired |
-| `DEPTHWISE_CONV_2D` (depth_multiplier 1, float + int8/uint8) | native depthwise conv (`rocket_conv2d_fp16` `depthwise=1`, G=32), **HW-validated bit-exact** | wired |
-| `CONV_2D`/`DEPTHWISE_CONV_2D`, **signed int8** (`native_int8=1`) | **NATIVE int8**: direct int8xint8->int32 (`rocket_conv2d_int8`, **multicore `_mt`**) + host per-axis requant; per-tensor DW int8-out on-chip requant (`rocket_conv2d_dw_int8`). On this int32 route the direct convs are **exact int8** (SSD head bit-identical to CPU TFLite); `direct_perc` moves a per-axis conv at a large plane to the int8-out entry below. The DW's on-chip requant is within one of TFLite at a rounding boundary | wired (`native_int8`) |
-| `DEPTHWISE_CONV_2D` **uint8** or int8, per-tensor (`native_int8=1`) | **NATIVE depthwise**: the same int8-out on-chip requant, uint8 recentered by 128, any per-tensor weight zero point (the DPU adds `-w_zp` times each window's input sum), the SAME pad materialized on the host. All 27 MobileDet depthwise layers, and all 15 SSD MobileNet v2 depthwise layers the delegate claims, the two 150×150 ones in row bands; warm 1.06x and 1.05x, mAP unchanged | wired (`native_int8`) |
-| `CONV_2D` **1×1** int8/uint8 (`native_int8=1`, `mm_int8` default-on) | **resident int8 matmul** (`rocket_matmul_int8_prepacked`, a 1×1 *is* a matmul), K/N pad %32 and M%4 gate; falls back to the conv otherwise. Bit-exact + **nt-deterministic**. +8% warm | wired (`mm_int8`) |
-| `CONV_2D` **uint8** DIRECT (`native_int8=1`) | **NATIVE uint8**: recenter to int8 (`x=in_q−128`, `y=w_q−128`), reuse `rocket_conv2d_int8` (**multicore `_mt`**), fold the centering into `eff_bias` + a per-output-pixel box-sum (`rocket_in_window_sum_i8`, **NEON-vectorized**, **separable** for KW>1, skipped when w_zp==128). **Exact uint8**, all 66 MobileDet convs native, scores ~35-40% lower error vs CPU than fp16. `direct_i8out` moves a per-tensor uint8 direct conv to the int8-out entry below | wired (`native_int8`) |
-| `CONV_2D` **uint8** DIRECT, per-tensor weights (`native_int8=1`, `direct_i8out=1`), RK3588 | **NATIVE int8-out**: the same recentered operands on `rocket_conv2d_int8_q`, requantized on chip (the weight zero point on the DPU's CPEND operand), so no int32 readback, box-sum or host requant. Within one count of TFLite at a rounding boundary: on MobileDet's 23 direct-path convs 0.037% of outputs differ by one, none by more. MobileDet warm 1.22-1.27x, SSD MobileNet v2 1.19-1.20x (pinned, `taskset -c 4-7`, four rotated passes), COCO mAP 0.3990 -> 0.3994 and 0.3197 -> 0.3213 over 100 images; unpinned on `ondemand` MobileDet 1.21-1.22x and SSD 1.17x | wired (`direct_i8out`, default-on under `native_int8`) |
-| `CONV_2D` **int8, per-axis** DIRECT (`native_int8=1`, `direct_perc` default-on), RK3588 | **NATIVE per-channel int8-out** (`rocket_conv2d_int8_q_perc`): the direct int8-out program with each output channel's scale on the BS stage's per-channel multiplier, one OUT_CVT gain per scale-class job, so no int32 readback or host requant. Under `pw_i8out_min_m` only a conv whose output plane reaches that many pixels takes it; smaller ones keep the int32-raw route. Within one count of TFLite at a rounding boundary: through EfficientDet-Lite0's 102 convs on TFLite's own input, 0.156% of outputs differ by one, none by more. With `pw_i8out_min_m=256`, EfficientDet-Lite0 warm 1.21-1.25x pinned and 1.29-1.33x unpinned on `ondemand`, COCO mAP 0.3019 -> 0.3023 over 100 images (CPU 0.2996) | wired (`direct_perc`, default-on under `native_int8`) |
-| `CONV_2D` **1×1** int8/uint8 at a plane of at least `pw_i8out_min_m` pixels (`native_int8=1`), RK3588 | **the int8-out direct writer** instead of the resident int8 matmul, for a 1×1 that `direct_i8out` (uint8, per-tensor) or `direct_perc` (int8, per-axis) takes: at large planes the matmul's int32 output, its host requant and its N padding cost more than the direct conv. At 256 (planes of 16×16 and up; measured on both sides at 100 and 400 pixels), MobileDet warm 1.37-1.41x and SSD MobileNet v2 1.23-1.28x pinned, 1.95-2.00x and 1.90x unpinned on `ondemand`; COCO mAP 0.3994 -> 0.4040 and 0.3213 -> 0.3229 over 100 images (CPU 0.3980, 0.3215). The moved layers differ from TFLite by one on 0.050% and 0.074% of outputs, never by more | wired (`pw_i8out_min_m`, 256 by default under `native_int8`) |
-| `DEPTHWISE_CONV_2D` **int8, per-axis** (`native_int8=1`, `dw_perc` default-on), RK3588 | **NATIVE per-channel depthwise** (`rocket_conv2d_dw_int8_perc`): the int8-out program with each channel's scale on the BS stage's per-channel multiplier, within one of TFLite at a rounding boundary. All 76 of EfficientDet-Lite0's claimed depthwise layers; warm 1.10x, mAP at CPU parity | wired (`dw_perc`) |
-| `CONV_2D`, int8/uint8 quantized (default) | dequant↔fp16 boundary, reuses the fp16 conv (a DW past the int8 programs' envelope, always) | wired |
-| `FULLY_CONNECTED` | **host** matmul (`rocket_fc_f`) by default, which beats the dispatch-bound NPU for a one-shot FC; **`fc_npu=1`** routes a large GEMM-shaped FC (M%4, K->%32, N->%16 zero-pad) to the resident fp16 matmul (M==1 GEMV stays host) | wired (`fc_npu` opt-in) |
-| `HARD_SWISH` / `LOGISTIC` (sigmoid) / `TANH` / `ELU` / `LOG` / `RELU` / `RELU6` / `RELU_N1_TO_1` / `LEAKY_RELU` / `EXP` / `SQRT` / `RSQRT` / `ABS` / `NEG` / `SQUARE` / `FLOOR` (standalone builtins) | **host** kernel (`rocket_unary_f/_q`, float + int8/uint8), which keeps `conv->act->conv` one contiguous partition. The `RELU` family and `NEG`/`SQUARE`/`FLOOR`/`ABS` are exact float arithmetic (byte-identical to CPU TFLite through the full delegate); `EXP`/`SQRT`/`RSQRT`/`LEAKY_RELU` are libm-exact. **`act_npu=1`** routes the curved kinds to the on-NPU DPU LUT (`ELU`->`rocket_elu_fp16`, `LEAKY_RELU`->`rocket_leaky_relu_fp16`; `EXP`/`SQRT`/`RSQRT`/`ABS`/`LOG` to the domain-limited LUT; `RELU`/`RELU6`/`RELU_N1_TO_1`/`NEG`/`SQUARE`/`FLOOR` are host-only, exact). `RELU`/`RELU6`/`RELU_N1_TO_1` are also fused into a preceding `CONV_2D` when the converter folds them. | wired (`aux_ops`) |
-| `MAXIMUM` / `MINIMUM` (two-tensor elementwise) | **host** NHWC kernel (`rocket_binary_f/_q`), which keeps partitions contiguous; **`ew_npu=1`** routes float to the on-NPU DPU EW ALU (`rocket_ew_max/min_fp16`, **bit-identical** to host) | wired (`aux_ops`) |
-| `MUL` / `SUB` / `DIV` (two-tensor elementwise, same-shape **or broadcast**, fused act) | **host** kernel (`rocket_arith_f/_q`, float + int8/uint8), siblings of `ADD` (`SUB`/`DIV` are non-commutative: `in0 op in1`); a broadcasting operand (per-channel `[C]`, scalar, general right-aligned) is materialized to the output shape first (`rocket_broadcast_copy`); keeps partitions contiguous | wired (`aux_ops`) |
-| `PRELU` (per-channel slope) | **host** kernel (`rocket_prelu_f/_q`, float + int8/uint8), the alpha constant dequantized to float[C]; **`act_npu=1`** routes float to the NPU (`rocket_prelu_fp16`, ew_max/mul, **bit-identical**) | wired (`aux_ops`) |
-| `MEAN` / `REDUCE_MAX` / `REDUCE_MIN` (axes [1,2] = spatial) | **host** kernel (`rocket_reduce_spatial_f/_q`), GlobalAvg/Max/MinPool; **`pool_npu=1`** routes float to the NPU PPU (`rocket_global_{avg,max,min}pool_fp16`) | wired (`aux_ops`) |
-| `RESIZE_NEAREST_NEIGHBOR` / `RESIZE_BILINEAR` (float + int8/uint8) | **host** kernel (`rocket_resize_*`, TFLite-exact align_corners/half_pixel coordinate math); **`resize_npu=1`** routes an integer-factor align_corners=false/half_pixel=false **nearest** resize to the NPU (`rocket_upsample_nearest_fp16` = block replication, **bit-identical**) | wired (`aux_ops`) |
-| `L2_NORMALIZATION` (over the channel axis) | **host** kernel (`rocket_l2norm_f/_q`, float + int8/uint8); **`norm_npu=1`** routes float to the NPU (`rocket_l2norm_fp16`) | wired (`aux_ops`) |
-| `TRANSPOSE_CONV` (float) | **host** scatter kernel (`rocket_transpose_conv_f`, TFLite pad mapping), which keeps `conv->tconv->conv` contiguous; int8 + the on-NPU route (`rocket_conv_transpose2d_fp16`) are the follow-on | wired (`aux_ops`) |
-| `SOFTMAX` (last axis), `LOG_SOFTMAX` (last axis), `CUMSUM` (last axis) | **host** kernel (`rocket_softmax_f/_q` with the `beta` logit scale, `rocket_logsoftmax_f/_q`, `rocket_cumsum_f/_q`, float + int8/uint8), stable row-max subtraction, keeps partitions contiguous; the NPU routes (`rocket_softmax_fp16` / `rocket_logsoftmax_fp16` / `rocket_cumsum_fp16`) are the follow-on | wired (`aux_ops`) |
-| `ADD` (residual), `AVERAGE`/`MAX_POOL_2D`, `CONCATENATION`, `RESHAPE` (float + int8/uint8) | **host** NHWC kernel (`rocket_ops.h`), which keeps partitions contiguous (`AVERAGE`/`MAX_POOL_2D` opt-in `pool_npu`) | wired (`aux_ops`) |
-| `TRANSPOSE`, `PAD`/`PADV2`, `SLICE`, `STRIDED_SLICE`, `SPLIT`/`SPLIT_V` (float + int8/uint8) | **host** byte-exact kernel (`rocket_transpose/slice/pad_bytes`, `rocket_ops.h`), pure layout moves (values pass through, quant scale/zp unchanged), so they keep `conv->layout->conv` ONE partition instead of splitting around a CPU node. Generic rank <= 8. `STRIDED_SLICE` handles any **non-zero** per-axis stride, positive or negative (the signed strided gather `rocket_strided_slice_bytes`, begin[] = the first/HIGH index when stride<0), with all five masks resolved per TFLite's Start/Stop rules: begin/end/shrink_axis plus **ellipsis_mask** (expands to full-range axes) and **new_axis_mask** (an output-only size-1 dim) via a spec->input-axis expansion that feeds the same byte gather. (The standard TF->TFLite converter lowers ellipsis/new-axis away, into explicit begin/end+masks and a separate `RESHAPE`, so these masks only arrive from hand-authored or non-standard producers; supported defensively.) No NPU route (the NPU has no on-chip layout-conversion engine) | wired (`aux_ops`) |
-| everything else | CPU fallback (automatic) | n/a |
+| `CONV_2D`, float, 1×1, stride 1, dilation 1, `IC%32==0`, `OC%16==0`, `IH·IW%4==0` | The resident fp16 matmul, `rocket_matmul_fp16_prepacked`: weights packed once at Prepare, `nthreads` workers. A shape the pack refuses runs on the fp16 convolution | Supported (default) |
+| `CONV_2D`, float, every other shape: K×K, stride, `SAME` or `VALID`, dilation | The fp16 convolution, `rocket_conv2d_fp16_ctx`, falling back to `rocket_conv2d_fp16` | Supported (default) |
+| `DEPTHWISE_CONV_2D`, float, depth multiplier 1 | The fp16 convolution's depthwise mode (`depthwise=1`, channel group 32), bit-exact [HW sweep] | Supported (default) |
+| `CONV_2D` and `DEPTHWISE_CONV_2D`, int8 or uint8 | The fp16 route: dequantized to fp16 at the boundary, the fp16 convolution, requantized on the host ([The fp16 route](#the-fp16-route)) | Supported (default) |
+| `CONV_2D`, int8 or uint8, under `native_int8=1` | The native int8 routes. [Native int8 routes](#native-int8-routes) gives which convolution takes which | Supported (opt-in) |
+| `DEPTHWISE_CONV_2D`, int8 or uint8, under `native_int8=1` | The native depthwise routes, `rocket_conv2d_dw_int8` and `rocket_conv2d_dw_int8_perc`, in [Native int8 routes](#native-int8-routes) | Supported (opt-in) |
+| `FULLY_CONNECTED`, float, constant weight, `M%4==0` or `M==1` | The host matmul, `rocket_fc_f`, which is faster than the NPU for a one-shot layer. `fc_npu=1` sends an `M%4==0` layer to the resident fp16 matmul with K padded to 32 and N to 16, and `M==1` stays on the host. Claimed whatever `aux_ops` is | Supported (default) |
+| `HARD_SWISH`, `LOGISTIC`, `TANH`, `ELU`, `LOG`, `RELU`, `RELU6`, `RELU_N1_TO_1`, `LEAKY_RELU`, `EXP`, `SQRT`, `RSQRT`, `ABS`, `NEG`, `SQUARE`, `FLOOR` | Host kernels `rocket_unary_f` and `rocket_unary_q`, the quantized form through a 256-entry table. The `RELU` family, `NEG`, `SQUARE`, `FLOOR` and `ABS` are exact float arithmetic, and `EXP`, `SQRT`, `RSQRT` and `LEAKY_RELU` are libm-exact. `act_npu=1` sends the curved kinds to the DPU LUT (below the table) | Supported (default) |
+| `MAXIMUM`, `MINIMUM`, same shape or broadcast | Host kernels `rocket_binary_f` and `rocket_binary_q`. `ew_npu=1` sends a float same-shape pair to the DPU EW ALU, `rocket_ew_max_fp16` and `rocket_ew_min_fp16`, bit-identical to the host | Supported (default) |
+| `ADD`, `MUL`, `SUB`, `DIV`, same shape or broadcast, fused activation | Host kernels (`ADD` in `rocket_ops.h`, the others `rocket_arith_f` and `rocket_arith_q`). `SUB` and `DIV` compute `in0 op in1` | Supported (default) |
+| `PRELU`, per-channel slope | Host kernels `rocket_prelu_f` and `rocket_prelu_q`, with the slope dequantized to float. `act_npu=1` sends the float form to `rocket_prelu_fp16`, bit-identical | Supported (default) |
+| `AVERAGE_POOL_2D`, `MAX_POOL_2D` | Host kernels in `rocket_ops.h`. `pool_npu=1` sends a float pool to the PPU, an average pool only with `VALID` padding | Supported (default) |
+| `MEAN`, `REDUCE_MAX`, `REDUCE_MIN`, axes 1 and 2 of a rank-4 tensor with batch 1 | Host kernels `rocket_reduce_spatial_f` and `rocket_reduce_spatial_q`. `pool_npu=1` sends the float form to `rocket_global_{avg,max,min}pool_fp16` | Supported (default) |
+| `CONCATENATION`, `RESHAPE` | Host kernels in `rocket_ops.h` | Supported (default) |
+| `RESIZE_NEAREST_NEIGHBOR`, `RESIZE_BILINEAR` | Host kernels `rocket_resize_nearest_f/_q` and `rocket_resize_bilinear_f/_q`, with TFLite's `align_corners` and `half_pixel_centers` coordinates. A quantized resize needs equal input and output scale and zero point. `resize_npu=1` sends a float nearest resize at an integer factor, with both flags false, to `rocket_upsample_nearest_fp16`, bit-identical | Supported (default) |
+| `L2_NORMALIZATION`, last axis, no fused activation | Host kernels `rocket_l2norm_f` and `rocket_l2norm_q`. `norm_npu=1` sends the float form to `rocket_l2norm_fp16` | Supported (default) |
+| `TRANSPOSE_CONV`, float | Host scatter kernel `rocket_transpose_conv_f`, with TFLite's pad mapping | Supported (default) |
+| `TRANSPOSE_CONV`, int8 or uint8 | Declined | Not supported |
+| `SOFTMAX`, `LOG_SOFTMAX`, last axis | Host kernels `rocket_softmax_f/_q`, with the `beta` logit scale, and `rocket_logsoftmax_f/_q`, with the row maximum subtracted | Supported (default) |
+| `CUMSUM`, last axis | Host kernels `rocket_cumsum_f` and `rocket_cumsum_q` | Supported (default) |
+| `TRANSPOSE`, `PAD`, `PADV2`, `SLICE`, `STRIDED_SLICE`, `SPLIT`, `SPLIT_V`, rank 8 or less | Host byte kernels (`rocket_transpose_bytes`, `rocket_slice_bytes`, `rocket_pad_bytes`, `rocket_strided_slice_bytes`). Values pass through and the quantization is unchanged | Supported (default) |
 
-MobileNet and MobileDet are **pointwise-heavy**, so the matmul-aligned 1×1 fast path
-offloads a real fraction of the network at multicore matmul speed. The general conv path
-covers the strided, KxK and dilated convs, such as the RGB stem.
+Every host-kernel row takes float, int8 and uint8 except where the row says otherwise, and needs
+`aux_ops=1`. `PAD` and `PADV2` take int32 paddings, and `SPLIT` and `SPLIT_V` an int32 axis.
+`STRIDED_SLICE` takes any nonzero stride, positive or negative, and all five masks with at most
+one ellipsis. An empty slice is declined. TFLite's converter lowers the ellipsis and new-axis
+masks into explicit begin and end values and a `RESHAPE`. Those two masks therefore arrive only
+from other producers.
 
-The mainline-rocket conv path is **fp16**, using the same `(target<<48)|(value<<16)|reg`
-encoding and NC1HWC2 packing the matmul uses. The general conv is therefore an extension of
-the matmul's domain rather than a rewrite.
+No layout op has an NPU route, because the NPU has no layout-conversion engine.
 
-Depthwise, the MobileNet workhorse, is **claimed in the delegate**. It runs on the native
-`DW_EN` path at group G=32, cracked against a Mesa Teflon regcmd capture. The delegate
-reorders TFLite's `[1,KH,KW,C]` filter to the
-driver's `[C,KH,KW]` (per-channel-axis-3 quant for int8/uint8) and routes to
-`rocket_conv2d_fp16` with `depthwise=1`. With pointwise (1×1=matmul), strided/stem
-direct conv, depthwise, and the host ADD/POOL/CONCAT seams all claimed, a
-MobileNet/SSD backbone is **NPU-resident**.
+`act_npu=1` sends `ELU` to `rocket_elu_fp16` and `LEAKY_RELU` to `rocket_leaky_relu_fp16`. It
+sends `HARD_SWISH`, `LOGISTIC`, `TANH`, `LOG`, `EXP`, `SQRT`, `RSQRT` and `ABS` to the DPU LUT,
+`rocket_activation_fp16`, whose input domain is limited. A quantized input is dequantized, passed
+through the LUT and requantized. `RELU`, `RELU6`, `RELU_N1_TO_1`, `NEG`, `SQUARE` and `FLOOR`
+stay on the host. A `RELU` the converter fused into a `CONV_2D` is applied in the convolution.
 
-### The ops around the conv (ADD / POOL / CONCAT / RESHAPE)
+A float MobileNet's or MobileDet's 1×1 convolutions, most of its multiply-accumulates, run on the
+resident fp16 matmul. A quantized model's 1×1 convolutions take the fp16 route by default, and
+the int8 matmul or an int8-out route under `native_int8=1`. With the pointwise, direct and
+depthwise convolutions and the ops between them claimed, a MobileNet or SSD backbone is one
+partition.
 
-A real detector is more than conv. Residual `ADD` (MobileNetV2/V3 + FPN), `AVERAGE_POOL_2D` and `MAX_POOL_2D` all sit
-*between* the convs. So do the `CONCATENATION` that joins an SSD head's box and class
-predictors, and the `RESHAPE` in that head. Left unclaimed, each is a partition boundary.
+### The ops between the convolutions
 
-The delegate claims them, float and int8/uint8, so the partitioner takes **contiguous
-subgraphs**. It computes them with thin **host** NHWC kernels (`rocket_ops.h`) rather than
-on the NPU. These are memory-bound elementwise and reduction ops, for which a dedicated
-regcmd is not warranted. Each conv also transposes NHWC↔NCHW itself, so claiming them does
-not save a transpose.
+A detector has more than convolutions. Residual `ADD` (MobileNetV2 and V3, FPN), the pools, the
+`CONCATENATION` that joins an SSD head's box and class predictors, and the `RESHAPE` in that head
+sit between them. Left unclaimed, each would end a partition.
 
-The win is fewer and larger partitions. The opt-in `nchw_resident` keeps a tensor that only
-conv-path ops produce and consume in fp16-NCHW, which skips that transpose. Its section under
-Quantization has the detail.
+The delegate claims them and computes them with host NHWC kernels. They are memory-bound
+elementwise and reduction ops. A convolution on the fp16 route transposes NHWC to NCHW and back
+itself, so claiming the ops around it does not save a transpose. The 1×1 matmul routes read and
+write NHWC directly. The gain is fewer, larger partitions. [`nchw_resident`](#nchw_resident)
+keeps some tensors in fp16 NCHW between convolutions and skips the transpose.
 
-Quant mirrors the conv boundary: per-tensor input and output scale and zp, requant to the
-output type. `ADD` keeps each input's own scale, `CONCATENATION` requantizes each input to
-the output scale, and pooling runs dequant, reduce, requant. It is gated by `aux_ops`,
-default on, for HW A/B.
+A quantized op between the convolutions uses per-tensor input and output scales and zero points
+and requantizes to the output type. `ADD` keeps each input's own scale, `CONCATENATION`
+requantizes each input to the output scale, and a pool dequantizes, reduces and requantizes.
 
-Broadcasting two-tensor elementwise is claimed: per-channel `[C]`, scalar, and general
-right-aligned. Each operand is materialized to the output shape (`rocket_broadcast_copy`),
-then the same-shape host kernel runs, bit-exact. Padding that is neither `SAME` nor `VALID`
-stays on the CPU. Each op is validated
-off-hardware by `convert_test` against an independent NHWC oracle, the same discipline as the
-conv glue.
+A broadcasting two-tensor op, per-channel `[C]`, scalar or general right-aligned, has each operand
+materialized to the output shape (`rocket_broadcast_copy`). The same-shape host kernel then runs,
+bit-exact. Those are the SE-block scale and bias-add forms. `convert_test` checks each host op
+against an independent NHWC reference.
 
-## Quantization
+## Quantized convolutions
 
-Detection models are typically **UINT8/INT8** quantized TFLite, and the NPU path is fp16.
-So the delegate **dequantizes int8->fp16 at the partition boundary**, runs fp16 on the NPU,
-then requantizes the output. The filter is dequantized once at `Prepare`, and the
-activations per inference. That is the same trick as ggml's f32↔fp16.
+### The fp16 route
 
-The per-inference input dequant maps each stored byte through a 256-entry fp16 lookup
-table, with the per-tensor scale and zero-point baked in once per call. It is bit-identical
-to the per-element arithmetic and ~1.2x faster on the A76 for feature-map-shaped inputs.
+The default for an int8 or uint8 convolution is the [fp16 route](README.md#terms). The delegate
+dequantizes the filter once at Prepare, with its per-axis scales and zero points, and the input
+per inference. It runs the fp16 convolution and requantizes the output on the host, clamped to
+the output type. The int32 bias is dequantized by `in_scale * w_scale[oc]`.
 
-This is **wired**. The gate accepts int8/uint8 `CONV_2D` and honours per-axis filter
-scales and zero points, with the int32 bias dequantized by `in_scale * w_scale[oc]`. The
-requant epilogue clamps to the output type.
+The input dequantization runs on 16-channel by 16-pixel NEON blocks. A 256-entry fp16 table,
+with the scale and zero point applied, handles the remainder and narrow planes. Both are
+bit-identical to the per-element arithmetic.
 
-Being fp16, it is an arithmetic approximation of TFLite's int32-accumulate int8 kernel
-rather than bit-identical to it. So `convert_test`'s quantized shapes validate the glue
-against an independent oracle
-that performs the *same* dequant->fp16-conv->requant path.
+The fp16 route approximates TFLite's int32-accumulating kernel and is not bit-identical to it.
+`convert_test`'s quantized shapes therefore check the glue against a reference that performs the
+same dequantize, fp16 convolution and requantize.
 
-A native int8 conv on the NPU, with its own regcmd encoding, removes the fp16 approximation and
-the host dequant. Its accumulate is **exact** int8, and its int8-out routes move the requant on
-chip too. It runs end-to-end and is HW-validated behind the default-off `native_int8` option.
-Its int32 and depthwise routes are these:
-- **DIRECT / 1×1** = int8xint8->int32 raw (`gen_conv2d_int8` -> `rocket_conv2d_int8` runtime
-  with OC/IC pad and OC/OH/OW tiling), plus host per-axis requant
-  (`rocket_out_nchw_to_nhwc_q_per_axis`, with the input zero-point correction folded into
-  the bias). It is a **real int8 accumulate, so an SSD head is BIT-IDENTICAL to CPU TFLite**
-  at `max|delegate−CPU|=0`, and a MobileNetV2 block's mean deviation halves.
-- **DEPTHWISE** = int8-OUT with **on-chip requant** (`gen_conv2d_dw_int8` + `int8_out=1` ->
-  `rocket_conv2d_dw_int8` runtime: raw int8 cubes with the input zero point folded into the
-  bias). **Per-tensor** quant at any weight zero point. The DPU's CPEND operand adds `-w_zp`
-  times each window's input sum, the term that cannot fold into the bias. Its accumulator is
-  TFLite's exactly and its requant is the DPU's. So an output can differ from CPU TFLite by one
-  at a rounding boundary, on 11 of 4096 outputs of one real model layer (`conv_dw_int8_runtime`).
-- **UINT8 DEPTHWISE** = the same runtime fed bytes recentered by 128, and every zero point
-  moves with them. The SAME pad is materialized on the host, so a stride-2 layer with an odd
-  pad is taken too. `rocket_conv2d_dw_int8_plan` decides the shape at claim time. The fused
-  activation is applied as TFLite's quantized clamp after the requant.
-- **UINT8 DIRECT** = the same `rocket_conv2d_int8` runtime fed RE-CENTERED bytes,
-  `x=in_q−128` and `y=w_q−128`, both always in [−128,127]. The per-OC centering constants
-  `α·Wy + N·α·β`, where α=128−in_zp and β=128−w_zp, fold into `eff_bias`. The
-  asymmetric weight zp's residual is a per-output-pixel **box-sum** `β·Sx` added at requant
-  (`rocket_in_window_sum_i8` / `rocket_out_nchw_to_nhwc_q_per_axis_u8`, **skipped when
-  w_zp==128**). No new regcmd.
+### Native int8 routes
 
-  The decisive fact is that real MobileDet is uint8 per-tensor with w_zp spread 91..177,
-  almost never 128. The symmetric-only trick fails there, and the box-sum is what makes it
-  exact. **All 66 MobileDet CONV_2D run native uint8** (`[native u8]`). Scores are ~35-40%
-  lower error against the CPU than fp16, several bit-identical, and all 13 `convert_test` nu8
-  shapes reach `max|dq|=0` on the NPU.
+`native_int8=1` runs int8 and uint8 convolutions with an exact int8 accumulate on the NPU. CPU
+TFLite is the reference for every native route:
 
-**Run it with `--option native_int8=1`.** Signed-int8 symmetric-weight convs, uint8 DIRECT
-convs at any weight zp, and per-tensor int8 or uint8 depthwise at any weight zp take the
-native path. A per-axis int8 depthwise takes `rocket_conv2d_dw_int8_perc` under `dw_perc`,
-default on, with each channel's scale on the DPU's per-channel multiplier.
+- **The int32 route** writes the int32 accumulator and requantizes on the host, which matches
+  TFLite exactly. An SSD head is bit-identical to CPU TFLite (`max|delegate-CPU|=0`), and a
+  MobileNetV2 block's mean deviation is half the fp16 route's.
+- **The int8-out routes** requantize on the NPU. They match TFLite's accumulator exactly and its
+  output within one count at a rounding boundary.
 
-The default sub-routes `direct_i8out`, `direct_perc` and `pw_i8out_min_m` move direct convs and
-large-plane 1×1s to the int8-out entries, within one count of TFLite. With `direct_i8out=0` and
-`direct_perc=0`, every direct and 1×1 conv stays on the exact int32 route.
+Under the default options a convolution takes this route:
 
-A depthwise plane past one CBUF pass runs in row bands on the int8 route, so SSD MobileNet v2's
-two 150×150 layers take it too. That is 1.05-1.06x warm. COCO mAP@[.5:.95] over 100 images
-reads 0.3197 against the fp16 route's 0.3157 (CPU 0.3215).
+| Convolution | Route | Entry |
+|---|---|---|
+| 1×1, aligned (K and N padded to 32, `IH·IW%4==0`), plane below `pw_i8out_min_m` or not taken by an int8-out route | Resident int8 matmul, int32 out, host requant | `rocket_matmul_int8_prepacked` (`mm_int8`) |
+| uint8, per-tensor weights, direct or 1×1 at `pw_i8out_min_m` pixels or more | Int8-out | `rocket_conv2d_int8_q` (`direct_i8out`) |
+| int8, per-axis symmetric weights, output plane of `pw_i8out_min_m` pixels or more | Int8-out | `rocket_conv2d_int8_q_perc` (`direct_perc`) |
+| int8 per-tensor, int8 per-axis below the plane threshold, uint8 per-axis, or any shape the int8-out planner refuses | Int32 | `rocket_conv2d_int8`, multicore `rocket_conv2d_int8_mt` |
+| Depthwise, int8 or uint8, per-tensor | Int8-out | `rocket_conv2d_dw_int8` |
+| Depthwise, int8, per-axis symmetric weights | Int8-out | `rocket_conv2d_dw_int8_perc` (`dw_perc`) |
+| Depthwise, uint8 per-axis, or past the int8 programs' limits | The fp16 route | `rocket_conv2d_fp16` |
 
-The operating point is the RK1 at 600 MHz, warm, with 30 invokes per process. Four passes
-rotate the arm order, with the governor pinned and the process on the A76 cores. MobileDet goes
-from 202-206 ms to 191-193 ms (1.06x), and SSD MobileNet v2 from 200-201 ms to 190-192 ms
-(1.05x). COCO-val mAP@[.5:.95] over 100 images moved by -0.0012 and -0.0001, against a
-CPU-to-delegate spread of +0.001 and -0.006.
+With `direct_i8out=0` and `direct_perc=0`, every direct and 1×1 convolution takes the int32 route.
+With `dw_perc=0`, a per-axis depthwise takes the fp16 route. If the fp16 planner accepts a
+convolution past every int8 program's limits, it takes the fp16 route, and otherwise it is
+declined.
+`rocket_conv2d_int8_q`, `rocket_conv2d_int8_q_perc` and `rocket_conv2d_dw_int8_perc` are RK3588
+only.
 
-The library's depthwise pack, blocked rather than
-per element, then takes MobileDet to 171-172 ms and SSD MobileNet v2 to 172-173 ms (1.12x and
-1.10x more), with byte-identical outputs. The same blocked pack in the fp16 conv and the int8
-direct conv follows. MobileDet then runs 150-152 ms, SSD MobileNet v2 130-132 ms, and
-EfficientDet-Lite0 255-257 ms where it ran 307-309, with byte-identical outputs again. Sizing
-the 1x1 route's matmul BOs to the tiles a call has then gives 130-131 ms, 119-120 ms and 228-230
-ms, byte-identical. Three host changes follow, each byte-identical:
+The int8-out routes differ from TFLite by one count on a small share of their outputs, and none
+differs by more [HW sweep]:
 
-- The quantized unary and concat kernels look their output up in a 256-entry table
-  (EfficientDet-Lite0 1.22-1.25x).
-- A one-K-tile matmul gathers straight into C (1.04-1.11x).
-- The `.so` is built with `-fno-math-errno`, so `lrintf` inlines (1.02-1.08x).
+- 0.037% of MobileDet's direct-convolution outputs
+- 0.156% of the outputs of EfficientDet-Lite0's 102 convolutions, run on TFLite's own input
+- 0.050% and 0.074% of the 1×1 outputs `pw_i8out_min_m` moves in MobileDet and SSD MobileNet v2
 
-The library's conv packs then move 16 pixels of a channel group at once, rather than one
-channel a pass (1.06-1.13x). The delegate's own conversions, ADD and max pool follow
-(1.04-1.12x). MobileDet runs ~100 ms, SSD MobileNet v2 85-86 ms and EfficientDet-Lite0 133-135
-ms, with outputs byte-identical to the build before all five.
+The depthwise int8-out route differs by one count on 11 of 4096 outputs of one real model layer
+(`conv_dw_int8_runtime`).
 
-The oracle is CPU TFLite for every native path. DIRECT int32-raw, both int8 and uint8, is a
-real accumulate and matches it exactly. DW int8-OUT and the direct int8-out entries requantize
-on the chip, so they match TFLite's accumulator exactly and its output to within one. A Teflon capture is not an oracle
-for it. Mesa's rocket driver is a uint8 driver, and its output for an int8 model differs
-from CPU TFLite by up to 162.
+> [!NOTE]
+> A Mesa Teflon capture is not a reference for the int8 routes. Mesa's `rocket` driver is a uint8
+> driver, and its output for an int8 model differs from CPU TFLite by up to 162.
 
-### fp16-NCHW resident inter-op buffers (`nchw_resident`, opt-in)
+#### uint8 convolutions
 
-A perf lever on the int8 conv chain. A partition-internal tensor produced and consumed
-only by general-conv-path ops is kept in **fp16-NCHW**, post bias and activation, between
-the ops. That skips the NHWC↔NCHW transpose **and** the int8 requant-to-dequant round-trip
-at that boundary.
+A uint8 direct convolution runs the int8 program on recentered bytes, `x=in_q-128` and
+`y=w_q-128`, both always in [-128,127]. With α=128−in_zp and β=128−w_zp, the per-channel
+constants `α·Wy + N·α·β` fold into the bias. The asymmetric weight zero point leaves a
+per-output-pixel box-sum `β·Sx`, which the int32 route adds at requant
+(`rocket_in_window_sum_i8_band`, `rocket_out_nchw_to_nhwc_q_per_axis_u8_band`). The delegate
+skips it where every weight zero point is 128. The int8-out route programs the weight zero point
+on the DPU's CPEND operand instead, so it has no int32 readback, box-sum or host requant.
 
-The win is a MobileNetV2 block warm at `12.66->9.34 ms` (1.36x), and the SSD head at
-`2.32->1.96 ms`. It is **off by default**, and `nchw_resident=1` opts in, because it
-changes int8 numerics: skipping the requant lets a tensor carry sub-int8 drift. Two guards
-and findings:
+MobileDet is uint8 per-tensor, with weight zero points spread 91-177 and almost never 128, so
+the box-sum is what makes it exact. All 66 of its `CONV_2D` run on the native uint8 routes, and
+`profile=1` tags them `[native u8]`. Their scores have 35-40% lower error against the CPU than the
+fp16 route's, several bit-identical. All 13 native uint8 shapes in `convert_test` reach
+`max|dq|=0` on the NPU.
 
-- **Re-quantization-barrier rule**, default-on when `nchw_resident=1`. A tensor stays
-  resident only if no consuming conv reaches a partition output through transparent ops
-  with no requant barrier in between. The transparent ops are `RESHAPE` and `CONCAT`, and a
-  barrier is another conv, `ADD` or `POOL`. The last conv before an output therefore always
-  reads requantized input.
-  That keeps damped chains resident, such as a block's project-to-`ADD`, and drops the SSD
-  predictors' direct inputs.
-- **Precision against the int8 reference.** The barrier rule alone does *not* keep the
-  delegate bit-close to the int8 *reference* in deep graphs. High-gain int8 convs compound
-  the drift, at SSD `max|delegate−CPU|` 52 and stack 63.
+#### Native depthwise
 
-  Measured against the **fp32 ground truth**, a paired float and int8 model through
-  `tools/precision_probe.py`, `nchw_resident=1` is neutral on max. The shared final output
-  quant dominates there. It is **better on the mean**, and moves *toward* fp32. The big
-  delta against int8 is distance from the lossy int8 reference rather than error. That is
-  why `nchw_resident` stays opt-in: native int8 gets the perf with an exact accumulate, and
-  its output stays within one count of TFLite.
+A per-tensor depthwise takes `rocket_conv2d_dw_int8` at any weight zero point. The input zero
+point folds into the bias. The DPU's CPEND operand adds `-w_zp` times each window's input sum,
+the term that cannot fold into the bias. uint8 bytes are recentered by 128 with every zero point.
+All three of a depthwise's tensors must be int8, or all uint8.
+
+The delegate materializes the `SAME` padding on the host, so a stride-2 layer with an odd pad is
+claimed too. `rocket_conv2d_dw_int8_plan` decides the shape at claim time, and the fused
+activation is applied as TFLite's quantized clamp after the requant. A plane past one CBUF pass
+runs in row bands, and in column bands where needed. SSD MobileNet v2's two 150×150 layers are
+therefore claimed too.
+
+A per-axis int8 depthwise takes `rocket_conv2d_dw_int8_perc`, with each channel's scale on the
+BS stage's per-channel multiplier. TFLite quantizes a depthwise filter per channel by default.
+
+#### Measured gains
+
+| Route | Model | Warm speedup, `performance` | Warm speedup, `ondemand` | COCO mAP, before -> after | CPU interpreter's mAP |
+|---|---|---:|---:|---:|---:|
+| Native depthwise, per-tensor | MobileDet | 1.06x | Not characterized | 0.0012 lower | Not characterized |
+| Native depthwise, per-tensor | SSD MobileNet v2 | 1.05x | Not characterized | 0.0001 lower | 0.3215 |
+| `dw_perc` | EfficientDet-Lite0 | 1.095-1.104x | Not characterized | 0.2998 (fp16 route) -> 0.3019 | 0.2996 |
+| `direct_i8out` | MobileDet | 1.22-1.27x | 1.21-1.22x | 0.3990 -> 0.3994 | Not characterized |
+| `direct_i8out` | SSD MobileNet v2 | 1.19-1.20x | 1.17x | 0.3197 -> 0.3213 | 0.3215 |
+| `pw_i8out_min_m=256` | MobileDet | 1.37-1.41x | 1.95-2.00x | 0.3994 -> 0.4040 | 0.3980 |
+| `pw_i8out_min_m=256` | SSD MobileNet v2 | 1.23-1.28x | 1.90x | 0.3213 -> 0.3229 | 0.3215 |
+| `direct_perc` | EfficientDet-Lite0 | 1.21-1.25x | 1.29-1.33x | 0.3019 -> 0.3023 | 0.2996 |
+
+**Conditions:** RK3588 (Turing RK1), the mainline `rocket` driver, NPU at ~816 MHz (the 600 MHz
+request), warm. Each speedup is against the build before the route, and the routes were added in
+the table's order. The `performance` column has the governor pinned and the process on the A76
+cores (`taskset -c 4-7`). The `ondemand` column has `scaling_min_freq` at 1.2 GHz. mAP@[.5:.95] is
+over 100 COCO val2017 images. Measured 2026-09-27 and 2026-09-28.
+
+With `pw_i8out_min_m=256`, 1×1 convolutions of 16×16 pixels and up move from the int8 matmul to
+the int8-out direct convolution. Its output needs no int32 readback or host requant. The matmul
+route also loses more to parked cores: on `ondemand` its time is 1.95x its pinned time, against
+the direct route's 1.36x.
+
+#### Evidence
+
+Each speedup is from four passes with the configuration order rotated, 30 invokes per process.
+The native depthwise rows measure MobileDet 202-206 ms -> 191-193 ms and SSD MobileNet v2
+200-201 ms -> 190-192 ms. Their mAP moved by -0.0012 and -0.0001 against a CPU-to-delegate spread
+of +0.001 and -0.006. SSD MobileNet v2's two 150×150 depthwise layers stayed on the fp16 route
+in that step, so its 0.3157 is the native depthwise row's result. With those two layers moved to
+the int8 route in row bands, its mAP measured 0.3197.
+
+On `performance`, EfficientDet-Lite0 measured 133 -> 121 ms under `dw_perc` and 123 -> 101 ms
+under `direct_perc`. MobileDet measured 93 -> 75 ms under `direct_i8out` and 77 -> 56 ms under
+`pw_i8out_min_m`, and 150 -> 76 ms on `ondemand`. The 256-pixel threshold was measured on both
+sides, at 100 and 400 pixels.
+
+### `nchw_resident`
+
+`nchw_resident=1` keeps a partition-internal tensor in fp16 NCHW, after bias and activation,
+between two convolutions on the fp16 route. That skips the NHWC-to-NCHW transpose and the
+requantize-dequantize round trip at that boundary. It is off by default because it changes the
+int8 numerics: a tensor that skips the requant keeps sub-count drift.
+
+A MobileNetV2 block runs 12.66 -> 9.34 ms warm (1.36x), and the SSD head 2.32 -> 1.96 ms.
+
+A tensor stays resident only where no consumer reaches a partition output through transparent ops
+without a requantization barrier between them. The transparent ops are `RESHAPE`,
+`CONCATENATION`, `TRANSPOSE`, `PAD`, `SLICE` and `STRIDED_SLICE`, and every other consumer is a
+barrier. The last convolution before an output therefore always reads a requantized input. The
+rule keeps damped chains resident, such as a block's projection into its `ADD`, and drops the
+SSD predictors' direct inputs. Residency also excludes the matmul routes and every native int8
+producer and consumer.
+
+Against the int8 reference, the barrier rule alone does not keep deep graphs close. High-gain
+int8 convolutions compound the drift, to `max|delegate-CPU|` of 52 on the SSD head and 63 on a
+convolution stack. Against the fp32 model, through `tools/precision_probe.py` on a paired float
+and int8 model, `nchw_resident=1` is neutral on the maximum error. The shared final output
+quantization dominates there. It is better on the mean, and moves toward fp32. The large difference
+from the int8 reference is distance from a lossy reference rather than error.
+
+## The RK3576 graph
+
+On an RK3576 the delegate lowers each delegated partition onto `librocketnpu`'s neutral
+description, and the driver library's `rocketgraph` plans and runs it as one network. The
+README's [RK3576 section](README.md#the-rk3576) has the claimed op set and the results. Only the
+`profile` and `rk3576` options have an effect on this path.
+
+The delegate does the TFLite lowering, in [rocket_rk3576_net.h](rocket_rk3576_net.h):
+
+- The claim
+- The geometry, with TFLite's asymmetric `SAME` padding expressed as an output extent. The
+  hardware derives the pad its last window consumes rather than taking a trailing pad.
+- The uint8-to-int8 rebase
+- The weight transposes, the buffers and the boundary layout
+
+`QUANTIZE` is claimed only as a requantization within one type. `profile=1` prints the plan, as
+`[rocket/rk3576] <n> layers: <j> joins, <f> far links, <r> run(s) over <l> layers`.
+`tools/rk3576_net_ab.py` scores a classifier against the interpreter with no delegate.
+
+> [!CAUTION]
+> Without an NPU device, Prepare fails with `[rocket/rk3576] no NPU device` and the model does not
+> load. The RK3588 routes compute on the library's CPU reference instead.
+
+### Per-axis quantization
+
+A convolution runs as one hardware task with one output converter shift. Each output channel
+reaches its own scale through a 16-bit multiplier in its coefficient group. A shift in the same
+stage lets the task's largest channel use the multiplier's whole range. A channel whose output
+cannot vary over its reachable inputs, such as a pruned all-zero filter, is programmed as that
+one byte. Only a live channel below 1/65534 of its task's largest live scale is refused.
+
+`rocket_conv2d_int8_perchannel_plan_rk3576()` answers that from the weights, the bias and the
+quantization scales, with no device. The delegate asks it at claim time, in its Prepare callback,
+where a refusal declines one node. The same refusal in the node kernel's Prepare would fail the
+whole model.
+
+On EfficientDet-Lite0 nothing is refused and no layer is split into output-channel tiles. It runs
+55.5 ms against 83.6 ms without the shift (0.661x paired). Its mAP@[.5:.95] over 500 val2017
+images is 0.2818 against the CPU's 0.2823 [HW sweep 2026-09-27, `rocket` 1.6.0].
+`ROCKET_RK3576_PC_SHIFT=0` restores the shift-0 ramp, whose detections are byte-identical to a
+build without the shift.
 
 ## Delegate options
 
-The delegate reads these external-delegate options:
+The delegate reads these external-delegate options. `load_delegate` passes each value as a
+string.
 
-| Option | Default | What it does |
+| Option | Default | Effect |
 |---|---|---|
-| `native_int8` | 0 | Run int8/uint8 convs on the native int8 datapath instead of the dequant↔fp16 boundary. Opt-in. The accumulate is exact, and the default-on `dw_perc`, `direct_i8out`, `direct_perc` and `pw_i8out_min_m` routes below requantize on chip, within one count of TFLite |
-| `mm_int8` | 1 | Route 1×1 int8/uint8 convs to the resident int8 matmul. Active only under `native_int8` |
-| `dw_perc` | 1 | Route a per-axis int8 depthwise to the per-channel entry (`rocket_conv2d_dw_int8_perc`, RK3588), each channel's scale on the DPU's per-channel multiplier. Active only under `native_int8`; 0 keeps it on the fp16 route |
-| `direct_i8out` | 1 | Route a uint8 DIRECT conv with per-tensor weights that reaches the direct conv (not the 1×1 matmul route) to the int8-out entry (`rocket_conv2d_int8_q`, RK3588): requantized on chip, within one count of TFLite at a rounding boundary. Active only under `native_int8`; 0 keeps the int32-raw route, whose host requant is TFLite's |
-| `direct_perc` | 1 | Route a signed-int8 DIRECT conv with per-axis filter scales to the per-channel int8-out entry (`rocket_conv2d_int8_q_perc`, RK3588), each channel's scale on the DPU's per-channel multiplier. Active only under `native_int8`; with `pw_i8out_min_m` set, only a conv whose output plane has at least that many pixels. 0 keeps the int32-raw route and its host requant |
-| `pw_i8out_min_m` | 256 | A 1×1 conv that `direct_i8out` or `direct_perc` takes runs on the int8-out direct writer instead of the resident int8 matmul when its plane has at least this many pixels. 0 keeps every eligible 1×1 on the matmul. Active only under `native_int8` |
-| `nthreads` | 4 | Worker fan-out across the 3 NPU cores. It sizes **both** the 1×1 matmul fan-out **and** the native int8/uint8 DIRECT conv worker pool `rocket_conv_pool` |
-| `min_macs` | 0 | Minimum `OC*OH*OW*IC*KH*KW` to offload. 0 offloads every supported conv |
-| `aux_ops` | 1 | Claim the host elementwise, pooling, activation and shape ops. Set 0 to restrict the delegate to the convs and `FULLY_CONNECTED` |
-| `profile` | 0 | Per-op timing to stderr, including the `breakdown in/conv/out` sub-step split, the resident set, and each conv's route (`native-dw-int8`, `native-dw-uint8`, `native-dw-perc`, `native-int8`, `native-int8-perc`, `native-uint8`, `native-uint8-i8out` or `fp16`) and its input plane |
-| `nchw_resident` | 0 | Keep conv-to-conv intermediates in fp16-NCHW between ops, skipping the per-boundary transpose and the int8 requant and dequant. Opt-in, and Quantization above has the detail |
-| `rk3576` | 1 | On an RK3576, run each delegated partition as one planned graph (`rocket_rk3576_net.h`). 0 is the A/B arm. No effect on any other part |
+| `native_int8` | `0` | Runs int8 and uint8 convolutions on the [native int8 routes](#native-int8-routes) instead of the fp16 route. The accumulate is exact, and the default int8-out routes requantize on chip within one count of TFLite |
+| `mm_int8` | `1` | Sends an aligned 1×1 int8 or uint8 convolution to the resident int8 matmul. Active only under `native_int8`, with a device open |
+| `dw_perc` | `1` | Sends a per-axis int8 depthwise to `rocket_conv2d_dw_int8_perc` (RK3588). Active only under `native_int8`. `0` keeps it on the fp16 route |
+| `direct_i8out` | `1` | Sends a uint8 convolution with per-tensor weights to the int8-out entry `rocket_conv2d_int8_q` (RK3588). Active only under `native_int8`. `0` keeps the int32 route, whose host requant is TFLite's |
+| `direct_perc` | `1` | Sends a signed int8 convolution with per-axis symmetric weights and an output plane of at least `pw_i8out_min_m` pixels to `rocket_conv2d_int8_q_perc` (RK3588). Active only under `native_int8`. `0` keeps the int32 route |
+| `pw_i8out_min_m` | `256` | The plane size, in pixels, from which a 1×1 that `direct_i8out` or `direct_perc` takes runs on the int8-out direct convolution instead of the int8 matmul, and from which `direct_perc` applies. `0` keeps every eligible 1×1 on the matmul and lets `direct_perc` take any plane. Active only under `native_int8` |
+| `nthreads` | `4` | Worker count, clamped to 1-8. It sizes the 1×1 matmul fan-out across the three NPU cores, the native direct-convolution pool `rocket_conv_pool`, the host requant and box-sum fan-out, and the matmul context `FULLY_CONNECTED` uses |
+| `min_macs` | `0` | The smallest convolution to claim, in `OC·OH·OW·IC·KH·KW` (`OC·OH·OW·KH·KW` for a depthwise). `0` claims every supported convolution |
+| `aux_ops` | `1` | Claims the host ops listed below. `0` restricts the delegate to the convolutions and `FULLY_CONNECTED` |
+| `profile` | `0` | Prints per-op timing to stderr: the `breakdown in/conv/out` split, the resident set, and each convolution's route and input plane |
+| `nchw_resident` | `0` | Keeps tensors between fp16-route convolutions in fp16 NCHW. [`nchw_resident`](#nchw_resident) has the detail |
+| `rk3576` | `1` | On an RK3576, runs each delegated partition as the [RK3576 graph](#the-rk3576-graph). `0` turns it off for comparison: the RK3588 routes then run, and their entries refuse on the RK3576. No effect on another part |
+
+An option name the delegate does not know is ignored, with one line on stderr naming it. A
+misspelled option runs the delegate at that option's default.
+
+`profile=1` names each convolution's route as one of `native-dw-perc`, `native-dw-uint8`,
+`native-dw-int8`, `native-int8-perc`, `native-int8`, `native-uint8-i8out`, `native-uint8` or
+`fp16`. The route name does not tell a 1×1 on the int8 matmul from one on the direct convolution.
+The breakdown line's tag does: `[mm i8]` for the matmul.
 
 `aux_ops` claims these host ops:
 
@@ -234,166 +346,75 @@ The delegate reads these external-delegate options:
   `SPLIT`/`SPLIT_V`
 - Other: `RESIZE_*`, `L2_NORMALIZATION`, `TRANSPOSE_CONV`, `SOFTMAX`, `LOG_SOFTMAX` and `CUMSUM`
 
-The claimed ops also have opt-in **on-NPU routes**, all defaulting to 0. The host kernel is
-exact and free, and the NPU route is an extra round-trip kept for A/B and cube-resident
-fusion:
+Some claimed ops also have an opt-in NPU route, each defaulting to `0`:
 
-| Option | Routes to the NPU |
+| Option | Sends to the NPU |
 |---|---|
-| `act_npu` | DPU LUT activations, and `PRELU` |
-| `ew_npu` | `MAXIMUM` and `MINIMUM`, on the DPU EW ALU |
-| `pool_npu` | `AVERAGE_POOL_2D`, `MAX_POOL_2D`, `MEAN` and `REDUCE_*`, on the PPU |
-| `resize_npu` | Integer-factor nearest resize |
-| `norm_npu` | `L2_NORMALIZATION` |
-| `fc_npu` | `FULLY_CONNECTED` |
+| `act_npu` | The LUT activations listed under the [op mapping](#tflite-op-mapping), and `PRELU` |
+| `ew_npu` | `MAXIMUM` and `MINIMUM`, float and same shape, on the DPU EW ALU |
+| `pool_npu` | Float `AVERAGE_POOL_2D` (`VALID` padding only), `MAX_POOL_2D`, `MEAN` and `REDUCE_*`, on the PPU |
+| `resize_npu` | A float nearest resize at an integer factor |
+| `norm_npu` | Float `L2_NORMALIZATION` |
+| `fc_npu` | `FULLY_CONNECTED` with `M%4==0`, with a device open |
 
-The driver dependency resolves via `find_package(rocketnpu)` if installed, else from a
-sibling `rocket-userspace` checkout. Override with
-`-DROCKETNPU_DIR=/path/to/rocket-userspace`.
+## Environment variables
 
-### Whether the delegate ran
+| Variable | Read by | Default | Effect |
+|---|---|---|---|
+| `ROCKET_CPU_AFFINITY` | `librocketnpu` | unset: the big cores | A CPU list to pin worker threads to. `off`, `none`, `0` or an empty value turns pinning off. Unset, every one-thread context's worker pins to the first big core, CPU 4 on the RK3588, so a pool needs one distinct core per process |
+| `ROCKET_CONV_BATCH` | `librocketnpu` | off | A value above `0` submits a native int8 direct convolution's tiles as one job. It helps only a convolution-tile-heavy model under a contended pool |
+| `ROCKET_REQUANT_SCALAR` | the delegate | unset | A value other than empty or `0` selects the scalar requant epilogues instead of the NEON ones. NEON builds only |
+| `ROCKET_BOXSUM_MODE` | the delegate | `0` | The box-sum implementation: `0` separable, `1` per-window, `2` scalar. It applies on NEON builds at unit stride and dilation, and a `KW` of 1 always uses `1` |
+| `ROCKET_PROF_POOL` | the delegate | unset | Any value other than `0` counts the host `parallel_oh` fan-out and prints one `[rocket-pool-probe]` line at exit |
+| `ROCKET_RK3576_PC_SHIFT` | `librocketnpu` | unset | `0` restores the RK3576 per-axis shift-0 ramp ([Per-axis quantization](#per-axis-quantization)) |
 
-Without a device the delegate still claims its nodes, and every conv then runs on the driver's
-CPU oracle. That output lands close enough to TFLite's to pass a comparison, so the outputs alone
-cannot say whether the NPU ran. The delegate therefore exports three process-wide counts:
+`ROCKET_CONV_BATCH` was neutral single-stream, and on MobileDet and EfficientDet under a pool. It
+gave 7.6% more aggregate throughput only on a convolution-tile-heavy test unit at four processes
+[HW sweep, June 2026]. Single-stream latency on that build was host-bound, not submit-bound.
+
+`ROCKET_PROF_POOL` prints `fanout_calls`, `threads_spawned` and `fanout_wall`: the fan-out calls,
+the threads created and the wall-clock time in fan-out regions. It prints nothing with
+`nthreads=1` or on the RK3576 graph. On SSDLite-MobileDet on 2026-07-01, thread creation and
+joining measured ~3.1 ms of a ~380 ms inference, ~0.83% [HW sweep].
+
+**Not characterized:** the thread cost on the current build. With an unchanged fan-out count, the
+same cost would be ~6% of a ~51 ms inference [expected].
+
+## Delegate counts
+
+The outputs alone cannot show whether the NPU ran. Without a device on the RK3588, the delegate
+still claims its nodes, and every convolution runs on the library's CPU reference. That reference
+is close enough to TFLite's output to pass a comparison. The delegate therefore exports three process-wide counts:
 
 ```c
 void rocket_delegate_counts(long *nodes_claimed, long *ops_npu, long *ops_host);
 ```
 
-`nodes_claimed` is the nodes the delegate took at Prepare. Per invoke, `ops_npu` counts the claimed
-ops dispatched to an NPU route with a device open, and `ops_host` the rest. A null pointer is
-skipped, and the counts accumulate over every delegate instance in the process. From Python,
-`ctypes.CDLL` on the path the delegate was loaded from reaches the same library. A harness reads
-the counts before and after the run it scores. `tools/delegate_counts.py` does that, and
-`coco_map.py`, `rk3576_net_ab.py`, `run_delegate.py` and `dw_native_e2e.py` all use it.
+`nodes_claimed` is the nodes the delegate claimed in its Prepare callback. Per invoke, `ops_npu`
+counts the claimed ops that completed on an NPU route. That is a convolution with a device open,
+or an op under a `*_npu` option whose result came back from the device. `ops_host` counts the rest,
+including an NPU attempt that fell back to the host kernel. A null pointer is skipped, and the counts accumulate over every
+delegate instance in the process. On the RK3576 graph the counts are per planned layer, not per
+node.
 
-### Recommended configuration
+From Python, `ctypes.CDLL` on the path the delegate was loaded from reaches the same library. Read
+the counts before and after the run you score. `tools/delegate_counts.py` does that, and
+`coco_map.py`, `rk3576_net_ab.py`, `run_delegate.py` and `dw_native_e2e.py` use it.
 
-For a detector (Frigate's regime), the two settings that matter, plus one that is not a delegate
-option at all:
+## Multi-camera throughput
 
-- **`native_int8=1`** runs the int8/uint8 convs on the native int8 datapath, and is the
-  default in the Frigate `rocket.py` plugin. Under its default sub-routes, MobileDet's COCO mAP
-  over 100 images is 0.4040 against the CPU's 0.3980 [HW sweep, 2026-09-28]. Over 500 images, on
-  the 2026-06-21 build with the host requant on every conv, it was 0.3321 against 0.3318.
-  `mm_int8=1`, the default under it, routes a 1×1 conv below `pw_i8out_min_m` pixels to the
-  resident int8 matmul.
-- **Leave `aux_ops=1`**, the default, so the host elementwise, pool and activation ops are
-  claimed and fused. The opt-in on-NPU routes (`act_npu`, `pool_npu`, and the rest) are A/B
-  knobs rather than throughput wins, because the host kernel is exact and free.
-- **Throughput comes from a process pool rather than a faster single stream.** A single
-  MobileDet inference takes ~56 ms warm with the governor pinned and ~76 ms on `ondemand`
-  (RK1, 600 MHz, 2026-09-28). Scale with **one delegate process per
-  camera**, each pinned to a distinct A76 core via the `ROCKET_CPU_AFFINITY` env var. On live
-  Frigate on 2026-07-01, at ~336 ms an inference, that gave 3.20 to 9.55 detection_fps at P=1
-  to 4 (2.98x). The pool has not been re-measured at the current latency. `nthreads`, default
-  4, fans a single conv across the 3 NPU cores, and the pool across streams is the larger lever.
-- **Keep the big cores off their floor.** The inference blocks while the NPU runs, so a
-  load-sampling CPU governor sees idle cores and parks them at `scaling_min_freq`. The host
-  cube gather then runs at that floor.
+Throughput comes from running several detection contexts at once, one process per stream, rather
+than from a faster single stream. One context's host packing and readback overlap another's NPU
+work. Warm single-stream MobileDet takes 51.4 ms with the governor pinned and 73.5 ms on
+`ondemand`, about 19 and 14 inferences a second [HW sweep 2026-10-29].
 
-  On the current build, where the A76 floor is 1.2 GHz, MobileDet runs 55.7 ms pinned against
-  75.8 ms unpinned on `ondemand`, 1.36x (2026-09-28). The 2026-08-25 build, at ~199 ms pinned,
-  paid 1.27x on that floor. On a vendor-kernel board whose floor is 408 MHz it paid 3.2x, 199.7
-  ms against 639.4 ms, with plain-CPU TFLite flat in both. That board has not been measured on
-  the current build. Raise the floor for the cores the detector processes run on.
-  `performance` everywhere is not needed, and pinning is required before any NPU-versus-CPU
-  number is quoted.
+The recipe needs no delegate or driver change. Run one process per stream, as Frigate runs
+cameras. In each, set `ROCKET_CPU_AFFINITY` to a distinct big core before the delegate loads:
+`4`, `5`, `6` and `7`. The contexts then spread across the four A76 cores rather than all pinning
+to the first one.
 
-`ROCKET_PROF_POOL=1` is an env knob, off by default and zero cost when unset. It tallies the
-host `parallel_oh` fan-out, meaning fan-out calls, threads spawned, and total wall in the
-fan-out regions, and prints one `[rocket-pool-probe]` line at exit.
-
-It exists to weigh a would-be persistent worker pool against the measured `std::thread`
-create-and-join cost before building one. On SSDLite-MobileDet on 2026-07-01, the spawn and
-join was ~3.1 ms of a ~380 ms inference, ~0.83%, so no pool was built. That verdict is the
-~380 ms build's. If the fan-out count is unchanged, the same cost is ~5.5% of the current
-~56 ms inference [expected]. Re-run this probe before relying on either figure.
-
-## Host-side work and remaining gaps
-
-### Host requant
-
-Under the default `native_int8` sub-routes, the int8-out entries requantize on chip and skip
-the host requant. On MobileDet, all 23 direct convs and 27 of the 43 1×1s, those at 400 pixels and up,
-take the int8-out writer. On EfficientDet-Lite0, `direct_perc` takes the per-axis convs of 256
-pixels and up. Each route sped its models up 1.19-1.41x pinned [HW sweep, RK1, 600 MHz,
-2026-09-27 and 2026-09-28].
-
-The host requant runs where an int32 route remains. That is a 1×1 on the matmul or a per-axis
-direct conv below `pw_i8out_min_m` pixels, and every direct and 1×1 conv with `direct_i8out=0`
-and `direct_perc=0`. Its share of the current single-stream wall is unmeasured. Every host
-epilogue is NEON-vectorized.
-
-**The M-major 1×1-to-matmul epilogue** is `rocket_out_mn_to_nhwc_q_per_axis*_band`, in both
-the signed/symmetric and the uint8-recenter `β·Sx` variants. A 1×1's output has the
-channels contiguous on *both* the int32 read and the NHWC write. It therefore requantizes
-8 channels per step with no scatter.
-
-It is bit-identical to the scalar `lrintf` epilogue, because every intermediate fits int32
-and `vcvtnq_s32_f32` is its round-nearest-ties-even. It was worth **+5.5 % warm MobileDet and
-+9.3 % EfficientDet-Lite0** in June 2026, with every aligned 1×1 on the matmul.
-`ROCKET_REQUANT_SCALAR=1` restores the scalar path for A/B or a non-NEON target.
-
-**The per-output-pixel box-sum** is `rocket_in_window_sum_i8`, the asymmetric-uint8 `β·Sx`
-residual. It is likewise NEON-vectorized for the contiguous case, skipped when every
-`w_zp==128`, and parallelized across the A76s by output-row band.
-
-For `KW>1` it uses a **separable** decomposition. The `IC·KH·KW` window sum splits into a
-channel and row reduce `T[iw]=Σ_{ic,kh} x[ic,oh·sy+kh·dy,iw]`, 16-wide, followed by a
-horizontal `KW` window-sum `Sx[oh,ow]=Σ_{kw} T[ow+kw]`, 4-wide. That cuts the SIMD
-column-pass count from `IC·KH·KW` to `IC·KH + KW` while keeping both passes vectorized.
-
-Pure integer adds are order-independent, so it is byte-identical to the per-window and
-scalar forms. `convert_test` reads `max|dq|=0` under `ROCKET_BOXSUM_MODE=0/1/2`, and the
-`boxsum_bench` gate cross-checks all three checksums.
-
-| Kernel | Box-sum speedup over the per-window NEON |
-|---|---|
-| 3×3 | 2.6x |
-| 5×5 | 3.3x |
-| 7×7 | 4.3x |
-
-That is ~10-16x over scalar. `ROCKET_BOXSUM_MODE` selects `0` for separable (the default),
-`1` for per-window and `2` for scalar, for A/B and as the non-NEON fallback.
-
-Its whole-model impact measured sub-1 % in June 2026. Under the default routes it runs only on
-a uint8 direct conv left on the int32 route. Such a conv is one under `direct_i8out=0`, or one
-the int8-out route does not take. A uint8 1×1 on the matmul sums its pixels during the recenter
-instead.
-
-**The NCHW direct-conv requant** is `rocket_out_nchw_to_nhwc_q_per_axis_band` signed and
-`_u8_band` uint8, also NEON-vectorized. It is oc-outer, because the conv accumulator is
-NCHW, so the NHWC write `dst[pix·OC+oc]` is strided. The per-pixel compute therefore
-vectorizes over 4 contiguous source pixels, and the 4 result bytes scatter out
-individually.
-
-It is bit-identical to the scalar epilogue, at the same float order, with `convert_test`
-`max|dq|=0` and both detectors byte-identical NEON against scalar.
-
-Per-function microbench is **1.6-3.4x**, and whole-model impact measured sub-1 % in
-June 2026. Under the default routes it runs only on a direct conv that stays on the int32
-route, as the start of this section lists.
-
-Which host term is largest under the current defaults is unmeasured. A `profile=1` run prints
-the per-op `breakdown in/conv/out` split that answers it.
-
-### Throughput pool for multi-camera
-
-Warm single-stream MobileDet takes ~56 ms with the governor pinned and ~76 ms on `ondemand`,
-about 18 and 13 fps (RK1, 600 MHz, 2026-09-28). Throughput comes from running several
-detection contexts concurrently rather than from a faster per-conv. One context's host pack
-and readback phase overlaps another's NPU phase.
-
-**The recipe needs no delegate or driver change.** Run one process per stream, exactly how
-Frigate runs cameras, and set `ROCKET_CPU_AFFINITY=<one distinct big core>` in each before
-the delegate loads, for example `4`, `5`, `6`, `7`. The P contexts then spread across the
-four A76 cores instead of colliding on one. The auto-affinity otherwise pins every 1-thread
-context's worker to big-core 0.
-
-Measured on the RK1 with `tools/pool_throughput.py`, a 1×1-conv submit-bound unit at
-600 MHz:
+`tools/pool_throughput.py` runs the delegate on a 1×1-convolution test unit whose cost is the
+submit:
 
 | Processes | Aggregate inferences/s, relative |
 |---:|---:|
@@ -402,22 +423,15 @@ Measured on the RK1 with `tools/pool_throughput.py`, a 1×1-conv submit-bound un
 | 3 | 3.11x |
 | 4 | 3.56x |
 
-That is end to end through the delegate, and it matches the driver gate's pool ceiling
-(`rocket-userspace/tests/ctx_pool_throughput.c`).
+That scaling matches `rocket-userspace`'s own multi-context throughput test. The contexts share one
+NPU, so `tools/pool_hash.py` runs the same fan-out and checks that every process's output hash
+equals the single-process one. On SSDLite-MobileDet, one process per A76 core at `nthreads=1`, it
+measured 3.33-3.51x at four processes, with one hash throughout [HW sweep 2026-10-29]. The aggregate
+rate is 52.9-53.6 inferences a second, at 928 MHz on the mainline driver. On 2026-08-26 it measured
+3.51-3.61x across the mainline and BSP drivers.
 
-A rate is not the whole gate. Several contexts share one NPU, so `tools/pool_hash.py` runs
-the same fan-out asserting that every process's output hash equals the single-process
-reference. It measured 3.51-3.61x at P=4 on SSDLite-MobileDet across the mainline and BSP
-drivers on 2026-08-26, one hash throughout.
-
-The application glue ships in `frigate/`: **Frigate's `rocket.py` detector plugin**, one
-process per camera at `num_threads: 1` with the per-process affinity env, plus config and
-compose.
-
-Live-validated on the RK1 on 2026-07-01 with a pool of `rocket0..rocket3` detectors, each
-pinned to a distinct A76, serving four SSD-MobileDet cameras. That is 600 MHz, with NPU IRQs
-pinned to the big cores via the driver repo's `npu_set_irq_affinity.sh throughput`. A single
-inference took ~336 ms on that build:
+In live Frigate, a pool of detectors `rocket0` to `rocket3`, each pinned to its own A76 core,
+served four SSD-MobileDet cameras:
 
 | Detectors | Aggregate `detection_fps` | Scaling |
 |---:|---:|---:|
@@ -426,41 +440,107 @@ inference took ~336 ms on that build:
 | 3 | 8.00 | 2.50x |
 | 4 | 9.55 | 2.98x |
 
-[HW sweep] The four A76 cores carry one detector each at ~73 % busy, while the A55s handle
-video decode.
+**Conditions:** RK3588 (Turing RK1), the mainline `rocket` driver, NPU at ~816 MHz (the 600 MHz
+request), `num_threads: 1` per detector, measured 2026-07-01. The NPU IRQs were pinned to the
+big cores with `rocket-userspace`'s `tools/npu_set_irq_affinity.sh throughput`. A single inference
+took ~336 ms on that build.
 
-On that build the live pool tracked below the submit-bound delegate ceiling, because the
-inference was host cube-scatter-and-gather-bound rather than submit-bound. Per-inference
-latency rose from 338 to 424 ms as the four contexts contended for DRAM bandwidth, so
-aggregate throughput tapered rather than reaching 4x. The live pool has not been re-measured at
-the current ~56 ms single stream.
+**Not characterized:** the live Frigate pool at the current 51.4 ms single stream.
 
-Under that contended pool, the `ROCKET_CONV_BATCH=1` knob coalesces a tiled conv's
-per-tile submits into one job. That cuts each process's trips through the shared submit and
-IOMMU path. Measured in June 2026, it was **neutral single-stream and on conv-tile-light
-MobileDet and EfficientDet, and +7.6 % aggregate only on a conv-tile-heavy unit at P=4**. So
-leave it off unless a model is conv-tile-heavy.
+The four A76 cores ran one detector each at ~73% busy, while the Cortex-A55 cores handled video
+decode. The live pool scaled below the test unit. That build's inference was bound by the host's
+cube packing and gathering, not by the submit. Per-inference latency rose from 338
+to 424 ms as the four contexts contended for DRAM bandwidth.
 
-Single-stream latency was host-bound rather than submit-bound in the `ROCKET_CONV_BATCH`
-measurement, so submit-coalescing was no single-stream lever there. The single-stream levers
-measured are the host packs and the on-chip requant routes the README lists.
+The Frigate plugin is in [frigate/](frigate/): one process per camera at `num_threads: 1`, with
+the per-process affinity. Its `config.yml` runs one detector at `num_threads: 4`, and
+[frigate/README.md](frigate/README.md) gives the pool layout.
 
-### Op-coverage gaps
+## Host-side work
 
-Measured against the common detection and vision op set. The high-value layout, vision and
-arithmetic ops are claimed. That is `RESIZE_*`, `PRELU`, `MEAN` and reduce, `TRANSPOSE`,
-`PAD`, `SLICE`, `STRIDED_SLICE`, `SPLIT`, `MUL`, `SUB`, `DIV`, `TRANSPOSE_CONV`, and the
-activation and elementwise batch.
+### Host requantization
 
-The two-tensor elementwise ops (`ADD`, `MUL`, `SUB`, `DIV`, `MAXIMUM`, `MINIMUM`) accept
-**NumPy and TFLite broadcast**: per-channel `[C]`, scalar, and general right-aligned shapes,
-which are the SE-block scale and bias-add cases. Each is lowered by materializing every
-operand to the output shape (`rocket_broadcast_copy`) before the exact same-shape host
-kernel.
+The int8-out routes requantize on chip and skip the host requant. On MobileDet all 23 direct
+convolutions and 27 of the 43 1×1s, those of 400 pixels and up, take them. On EfficientDet-Lite0
+`direct_perc` takes the per-axis convolutions of 256 pixels and up.
 
-`STRIDED_SLICE` handles any **non-zero stride, positive or negative**, the signed strided
-gather, with all five masks resolved per TFLite's Start and Stop rules. The ellipsis and new-axis
-masks are expanded to per-input-axis begin, size and stride before the same gather.
+The host requant runs where the int32 route remains:
 
-The remaining gap is moving the host `ADD`, `POOL`, `CONCAT` and layout kernels onto DPU regcmd,
-once inter-op buffers are NCHW-resident.
+- A 1×1 on the int8 matmul
+- A per-axis int8 direct convolution below `pw_i8out_min_m` pixels
+- Every per-tensor int8 and per-axis uint8 direct convolution
+- Any convolution the int8-out planner refuses
+- Every direct and 1×1 convolution with `direct_i8out=0` and `direct_perc=0`
+
+Every host epilogue is NEON-vectorized, and `ROCKET_REQUANT_SCALAR` selects the scalar forms.
+
+**Not characterized:** the host requant's share of the current single-stream time. A `profile=1`
+run prints the per-op `breakdown in/conv/out` split that measures it.
+
+#### The 1×1 epilogue
+
+`rocket_out_mn_to_nhwc_q_per_axis_band` and its uint8 form `_u8_band` requantize a matmul's
+output. A 1×1's output has the channels contiguous in both the int32 read and the NHWC write. The
+epilogue therefore requantizes 8 channels per step with no scatter. It is bit-identical to the scalar
+`lrintf` epilogue, because every intermediate fits int32 and `vcvtnq_s32_f32` rounds to nearest
+with ties to even. It gave 5.5% on warm MobileDet and 9.3% on EfficientDet-Lite0 in June 2026,
+with every aligned 1×1 on the matmul.
+
+#### The box-sum
+
+`rocket_in_window_sum_i8_band` computes the uint8 route's `β·Sx` term. It is NEON-vectorized at
+unit stride and dilation, skipped when every weight zero point is 128, and split across the A76
+cores by output-row band.
+
+For `KW>1` it is separable. The `IC·KH·KW` window sum splits into a channel and row reduction
+`T[iw]=Σ_{ic,kh} x[ic,oh·sy+kh·dy,iw]`, 16 wide, and a horizontal `KW` window sum
+`Sx[oh,ow]=Σ_{kw} T[ow+kw]`, 4 wide. That cuts the vector column passes from `IC·KH·KW` to
+`IC·KH + KW`, with both passes vectorized. Integer adds are order-independent, so the result is
+byte-identical to the per-window and scalar forms. `convert_test` reaches `max|dq|=0` under each
+`ROCKET_BOXSUM_MODE`, and `boxsum_bench` cross-checks the three checksums.
+
+| Kernel | Speedup over the per-window NEON form |
+|---|---|
+| 3×3 | 2.6x |
+| 5×5 | 3.3x |
+| 7×7 | 4.3x |
+
+The separable form is ~10-16x the scalar one. Its whole-model effect measured below 1% in
+June 2026. Under the default routes it runs only on a uint8 direct convolution left on the int32 route.
+A uint8 1×1 on the matmul sums its pixels during the recentering instead.
+
+#### The direct-convolution epilogue
+
+`rocket_out_nchw_to_nhwc_q_per_axis_band` and `_u8_band` requantize a direct convolution's NCHW
+accumulator into NHWC. They run channel-outer, so the NHWC write `dst[pix·OC+oc]` is strided. The
+computation vectorizes over 4 contiguous source pixels and writes the 4 result bytes out one at a
+time. It is bit-identical to the scalar epilogue, with the same float order: `convert_test`
+reaches `max|dq|=0`, and both detectors are byte-identical with NEON and without. Its function
+benchmark is 1.6-3.4x, and its whole-model effect measured below 1% in June 2026.
+
+### Evidence
+
+Single-stream latency by build, each change measured against the build before it, warm, at
+~816 MHz (the 600 MHz request). The first two changes are June 2026 builds, and the native
+depthwise and everything after it are from 2026-09-27 on. Every change after the native depthwise
+left the outputs byte-identical, and the three before it were bit-exact.
+
+| Change | MobileDet | SSD MobileNet v2 | EfficientDet-Lite0 |
+|---|---|---|---|
+| Resident device state: weights packed at Prepare, a resident convolution buffer pool (`rocket_conv_ctx`) with each buffer role cached by power-of-two size. A warm MobileNetV2 block went ~28 -> 12 ms (~3x) | | | |
+| Multicore direct convolution (`rocket_conv_pool`, `rocket_conv2d_int8_mt`) across the three cores | 560 -> 458 ms (1.21x) | | |
+| 1×1 int8 and uint8 on the resident int8 matmul (`mm_int8`) | 366 -> 336 ms (8%) | | |
+| Native depthwise, per-tensor | 202-206 -> 191-193 ms | 200-201 -> 190-192 ms | |
+| The library's depthwise pack blocked rather than per element | 171-172 ms (1.12x) | 172-173 ms (1.10x) | |
+| The same blocked pack in the fp16 and int8 direct convolutions | 150-152 ms | 130-132 ms | 307-309 -> 255-257 ms |
+| The 1×1 route's matmul buffers sized to the tiles a call has | 130-131 ms | 119-120 ms | 228-230 ms |
+| Quantized unary and concatenation through a 256-entry table | 1.04x | 1.04x | 1.22-1.25x (`LOGISTIC` 35 -> 2.6 ms, concatenation 11 -> 0.5 ms) |
+| A one-K-tile matmul gathered straight into C | 1.07-1.09x | 1.04-1.07x | 1.10-1.11x |
+| `lrintf` inlined by `-fno-math-errno` | 1.02-1.03x | 1.03-1.04x | 1.05-1.08x |
+| The library's convolution packs transposed with NEON, 16 pixels of a channel group at a time | 1.07-1.08x | 1.11-1.13x | 1.06-1.07x |
+| The delegate's own NHWC and NCHW conversions transposed, a NEON `ADD` and a byte-max pool | 1.04-1.06x, to ~100 ms | 1.09-1.11x, to 85-86 ms | 1.10-1.12x, to 133-135 ms |
+
+The int8-out routes and `dw_perc` followed, in [Measured gains](#measured-gains). The 256-entry
+input dequantization table measured ~1.2x the per-element arithmetic on the A76 for
+feature-map-shaped inputs. The 2026-06-21 build, with the host requant on every convolution,
+measured MobileDet mAP@[.5:.95] 0.3321 against the CPU's 0.3318 over 500 val2017 images.

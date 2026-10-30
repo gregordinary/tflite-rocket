@@ -121,8 +121,8 @@ class RocketDetector(DetectionApi):
         except (ValueError, OSError) as e:
             logger.error(
                 "Failed to load the rocket delegate from %s: %s. Check that the .so "
-                "exists in the container and that /dev/accel/accel0 is passed through "
-                "(devices:) with the host render group (group_add:).",
+                "exists in the container, that LD_PRELOAD names libtflite_cshim.so, and "
+                "that the .so was built for the image's glibc (TFLITE_ROCKET_PORTABLE_GLIBC).",
                 detector_config.delegate_path,
                 e,
             )

@@ -184,7 +184,8 @@ static inline void rocket_unary_q(const void *in, void *out, size_t n, int kind,
 }
 
 /* ==========================================================================
- * ADD — elementwise residual add, SAME shape (no broadcast in v1), fused act.
+ * ADD — elementwise residual add over SAME-shape operands, fused act. The delegate
+ * materializes a broadcasting operand to the output shape before the call.
  * ========================================================================== */
 
 static inline void rocket_add_f(const float *a, const float *b, float *o,
@@ -594,9 +595,9 @@ static inline void rocket_concat_in_q(const void *in, void *out,
 /* ==========================================================================
  * RESIZE / UPSAMPLE — RESIZE_NEAREST_NEIGHBOR / RESIZE_BILINEAR, NHWC, per channel
  * (FPN / decoder neck). The coordinate math mirrors TFLite's reference kernels
- * (align_corners / half_pixel_centers) so a PASS is bit-exact-vs-CPU; the delegate
- * can route an integer-factor half-pixel resize onto the NPU (rocket_upsample_*)
- * under a narrow gate. Quant is a value pass-through (resize never rescales) — int8/
+ * (align_corners / half_pixel_centers) so a PASS is bit-exact-vs-CPU; under resize_npu
+ * the delegate routes a float nearest resize at an integer factor, with both flags
+ * false, onto the NPU (rocket_upsample_nearest_fp16). Quant is a value pass-through (resize never rescales) — int8/
  * uint8 just gather the SAME stored bytes (nearest) or lerp the dequantized values
  * (bilinear, requantized to the unchanged output scale/zp).
  * ========================================================================== */
@@ -1012,8 +1013,9 @@ static inline void rocket_slice_bytes(void *dst, const void *src,
 /* STRIDED_SLICE with a signed per-axis stride: out[oc] = in[begin[d] + oc[d]*stride[d]].
  * out_dims is the per-axis loop-step count the delegate resolved from TFLite's
  * Start/Stop rules; begin[] is the FIRST gathered index (the HIGH index when stride[d]<0,
- * walking down) and stride[d] is signed (!=0). (ellipsis / new-axis masks stay on CPU —
- * those remap the begin/end/stride axes; see the delegate gate.) */
+ * walking down) and stride[d] is signed (!=0). The delegate resolves the ellipsis and
+ * new-axis masks, which remap the begin/end/stride axes, into these per-axis values
+ * before the call. */
 static inline void rocket_strided_slice_bytes(void *dst, const void *src,
                                               int rank, const int *in_dims,
                                               const int *begin, const int *stride,

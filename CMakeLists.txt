@@ -91,17 +91,25 @@ if(DEFINED TFLITE_DIR)
     # rocketnpu package rather than living here because a second copy of those rules would
     # fork silently; see rocket_rk3576_net.h.
     target_link_libraries(tflite_rocket PRIVATE rocketnpu::rocketgraph rocketnpu::rocketnpu)
+    # The driver and planner come in as static archives. --exclude-libs keeps their symbols
+    # inside the .so, so another copy of librocketnpu in the process cannot interpose on them.
+    # The exports are the delegate's own: the two plugin entry points, the counts, and the
+    # weak C++ symbols its sources emit (rocket_rk3576_net.h's inline functions and std::
+    # template instantiations).
+    target_link_options(tflite_rocket PRIVATE "LINKER:--exclude-libs,ALL")
     target_compile_options(tflite_rocket PRIVATE -Wall -Wextra ${ROCKET_TFLITE_HOST_FLAGS})
 
-    # Portability: internalize the glibc 2.38 __isoc23_strtol/fscanf symbols so the .so
-    # loads on an older-glibc runtime (e.g. a Debian-bookworm Frigate container) even
-    # when built on a newer host. Off by default (normal builds are byte-unchanged); see
-    # glibc_compat.c. The shim must be C11 so its own strtol/fscanf aren't redirected.
+    # Portability: internalize the symbols a newer glibc versions above 2.34 (glibc 2.38's
+    # __isoc23_* parsers, glibc 2.43's sqrtf) so the .so loads on an older-glibc runtime
+    # (e.g. a Debian-bookworm Frigate container) even when built on a newer host. Off by
+    # default (normal builds are byte-unchanged); see glibc_compat.c. The shim must be C11
+    # so its own strtol/scanf aren't redirected, and built without math errno so its sqrtf
+    # is the instruction rather than a call to itself.
     option(TFLITE_ROCKET_PORTABLE_GLIBC
            "Link a shim so the .so loads on glibc < 2.38 (e.g. the Frigate image)" OFF)
     if(TFLITE_ROCKET_PORTABLE_GLIBC)
         target_sources(tflite_rocket PRIVATE glibc_compat.c)
-        set_source_files_properties(glibc_compat.c PROPERTIES COMPILE_OPTIONS "-std=gnu11")
+        set_source_files_properties(glibc_compat.c PROPERTIES COMPILE_OPTIONS "-std=gnu11;-fno-math-errno")
         message(STATUS "tflite-rocket: PORTABLE_GLIBC on -> .so floors at glibc 2.34")
     endif()
 
@@ -119,6 +127,24 @@ if(DEFINED TFLITE_DIR)
     add_library(tflite_cshim SHARED tools/tflite_c_shim.c)
     set_target_properties(tflite_cshim PROPERTIES PREFIX "lib" OUTPUT_NAME tflite_cshim)
     target_include_directories(tflite_cshim PRIVATE ${TFLITE_DIR})
+
+    # A glibc reference with no forwarder in the shim, or a libstdc++ symbol newer than
+    # bookworm's GCC 12 provides, links cleanly and then fails to load in the older image. So
+    # check both .so's the Frigate image ships for any import versioned above GLIBC_2.34,
+    # GLIBCXX_3.4.30 or CXXABI_1.3.13, rather than trust the shim's list. Without objdump the
+    # check could not read the imports and would pass, so its absence stops here.
+    if(TFLITE_ROCKET_PORTABLE_GLIBC)
+        set(_portable_objdump "${CMAKE_OBJDUMP}")
+        if(NOT _portable_objdump)
+            message(FATAL_ERROR "tflite-rocket: PORTABLE_GLIBC checks the .so's imports with "
+                                "objdump, and none was found. Install binutils.")
+        endif()
+        foreach(t tflite_rocket tflite_cshim)
+            add_custom_command(TARGET ${t} POST_BUILD
+                COMMAND sh -c "syms=$(\"$1\" -T \"$2\") || exit 1; if printf '%s\\n' \"$syms\" | grep UND | grep -E 'GLIBC_2[.](3[5-9]|[4-9][0-9])|GLIBCXX_3[.]4[.](3[1-9]|[4-9][0-9])|CXXABI_1[.]3[.](1[4-9]|[2-9][0-9])'; then echo 'tflite-rocket: PORTABLE_GLIBC: the .so needs a glibc above 2.34 or a libstdc++ above GCC 12 for the symbols above; forward a glibc one in glibc_compat.c, and change the source that needs a libstdc++ one' >&2; exit 1; fi" sh ${_portable_objdump} $<TARGET_FILE:${t}>
+                VERBATIM)
+        endforeach()
+    endif()
 else()
     message(STATUS "tflite-rocket: TFLITE_DIR unset -> skipping libtflite_rocket.so "
                    "(build/run `convert_test` to gate the glue without TFLite).")

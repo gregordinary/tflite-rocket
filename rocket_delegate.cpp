@@ -23,8 +23,9 @@
  * int8 kernel. With the `native_int8` option a NATIVE int8/uint8 conv path
  * runs int8 directly on the NPU with no host dequant (direct + 1x1, plus per-tensor
  * int8 or uint8 depthwise via the int8-out on-chip-requant runtime, whose DPU carries an
- * asymmetric weight zero point); a per-channel depthwise falls back to the fp16
- * approximation. See rocket_convert.h.
+ * asymmetric weight zero point, and a per-axis int8 depthwise via its per-channel form,
+ * `dw_perc`); a uint8 per-axis depthwise takes the fp16 approximation. See
+ * rocket_convert.h.
  *
  * Beyond conv, the delegate also claims the ops a real detector graph carries AROUND
  * its convolutions so the partitioner can take CONTIGUOUS subgraphs instead of one
@@ -33,13 +34,14 @@
  * inside the delegate — memory-bound elementwise/reduction work for which inventing
  * NPU regcmd is not worth it in a v1; see rocket_ops.h. They do NOT move work to the
  * NPU (and since each conv transposes NHWC<->NCHW itself, they don't save a transpose)
- * — the win is fewer/larger partitions, with NCHW-resident inter-op buffers as a
- * follow-up. They are gated by the `aux_ops` option (default on) for HW A/B.
+ * — the win is fewer/larger partitions, and the `nchw_resident` option keeps a
+ * conv-to-conv buffer fp16-NCHW across the layout-only ops between them. They are gated
+ * by the `aux_ops` option (default on) for HW A/B.
  *
  * Everything this delegate does not claim falls back to CPU via TFLite's graph
- * partitioner: depthwise with depth_multiplier != 1, a depthwise layer too big for one
- * CBUF pass (the driver has no DW spatial tiling yet), grouped convs, broadcast ADD,
- * and fused activations beyond None/Relu/Relu6/ReluN1To1.
+ * partitioner: depthwise with depth_multiplier != 1, a convolution the driver's planner
+ * refuses, grouped convs, a runtime (non-constant) filter or bias, and fused activations
+ * beyond None/Relu/Relu6/ReluN1To1.
  *
  * Builds to libtflite_rocket.so, loadable by tflite_runtime:
  *   tflite.load_delegate("libtflite_rocket.so",
@@ -90,7 +92,8 @@ void rocket_pin_worker(int worker_idx);
 // assert rather than infer. Without a device the RK3588 path computes every conv on the
 // driver's CPU oracle, close enough to TFLite's arithmetic to pass a comparison, so outputs
 // alone cannot tell a run on the NPU from none. `ops_npu` counts, per invoke, the claimed ops
-// dispatched to an NPU route with a device open; `ops_host` the rest. rocket_delegate_counts()
+// that completed on an NPU route (a conv with a device open, or an opt-in route that returned
+// its result from the device); `ops_host` the rest, fallbacks included. rocket_delegate_counts()
 // reads all three, and they accumulate over every delegate instance in the process.
 static std::atomic<long> g_rocket_nodes_claimed{0};
 static std::atomic<long> g_rocket_ops_npu{0};
@@ -158,9 +161,10 @@ struct RocketOptions {
                                 // NHWC in/out need no transpose and the integer accumulate is
                                 // exact, so the result is BYTE-IDENTICAL to the conv path (a kill
                                 // switch / A-B toggle — only takes effect under native_int8). K/N
-                                // are zero-padded to %32; M%4||M==1 or it stays on the conv path.
-    bool act_npu = false;       // run the claimed unary activations (HardSwish / Sigmoid) on the
-                                // NPU DPU LUT (rocket_activation_fp16) instead of the exact host
+                                // are zero-padded to %32; M%4 or it stays on the conv path.
+    bool act_npu = false;       // run the claimed LUT activations (the curved kinds, ELU and
+                                // LEAKY_RELU) and PRELU on the NPU DPU (rocket_activation_fp16
+                                // and its siblings) instead of the exact host
                                 // kernel. OFF by default: the host kernel is exact + free (a
                                 // standalone NPU LUT pass is an extra round-trip), so this is an
                                 // A/B / demonstration toggle for the on-NPU nonlinearity. Falls
@@ -214,13 +218,14 @@ struct RocketOptions {
 };
 
 // A 1x1 stride-1 conv we can hand to the matmul: just the matmul's HARD alignment
-// (K%32, N%16, M%4||M==1; M = H*W positions, K = IC, N = OC). The old "worth
+// (K%32, N%16, M%4; M = H*W positions, K = IC, N = OC). The resident packs refuse M==1,
+// so a one-pixel 1x1 takes the conv path. The old "worth
 // offloading" size floor (K,N>=64, M>=4) is gone: with the weights resident (packed
 // once in Prepare, only the activation packed per call) even a small aligned 1x1 is
 // cheaper on the matmul than re-running the 5-BO conv job, so every aligned 1x1
 // offloads. Non-aligned 1x1s (e.g. IC%32!=0) still take the conv path.
 static bool dims_offloadable(int M, int K, int Ncout) {
-    return (K % 32 == 0) && (Ncout % 16 == 0) && (M % 4 == 0 || M == 1) && M >= 1;
+    return (K % 32 == 0) && (Ncout % 16 == 0) && M % 4 == 0 && M >= 4;
 }
 
 static int round_up(int x, int m) { return (x + m - 1) / m * m; }
@@ -336,6 +341,7 @@ static bool same_dims(const TfLiteIntArray *a, const TfLiteIntArray *b) {
 // and runs the existing same-shape host kernel, so the result is bit-exact.
 static bool broadcast_to(const TfLiteIntArray *in, const TfLiteIntArray *out) {
     if (!in || !out || in->size > out->size) return false;
+    if (out->size > ROCKET_MAX_RANK) return false;    // rocket_broadcast_copy's fixed arrays
     int off = out->size - in->size;
     for (int i = 0; i < in->size; i++)
         if (in->data[i] != 1 && in->data[i] != out->data[off + i]) return false;
@@ -386,7 +392,7 @@ struct ConvNode {
     // weight is zero-padded to [Np,Kp] (Np=ceil(OC,32), Kp=ceil(IC,32)) and scattered into
     // resident NPU BOs ONCE on the kernel's mm_i8_ctx_; Eval then runs the int8 matmul
     // (output columns fanned across the 3 cores) + a per-pixel requant. mm_w_i8 is null when
-    // the conv is not native int8/uint8, M%4||M==1 fails, mm_int8 is off, or no device.
+    // the conv is not native int8/uint8, M%4 fails, mm_int8 is off, or no device.
     rocket_i8_weights *mm_w_i8 = nullptr;
     int                mm_i8_M = 0;     // spatial M the resident int8 weights were packed for
 
@@ -503,6 +509,10 @@ static bool analyze_conv(const TfLiteRegistration *reg, const TfLiteNode *node,
     const TfLiteTensor &flt  = ctx->tensors[node->inputs->data[1]];
     const TfLiteTensor &outp = ctx->tensors[node->outputs->data[0]];
     const bool has_bias = node->inputs->size > 2 && node->inputs->data[2] >= 0;
+    // pack_weights reads the filter and bias once in Prepare, so a runtime tensor there
+    // would fail the whole model: decline it here and the interpreter runs the node.
+    if (!flt.data.data) return false;
+    if (has_bias && !ctx->tensors[node->inputs->data[2]].data.data) return false;
 
     auto is_q = [](TfLiteType t) { return t == kTfLiteInt8 || t == kTfLiteUInt8; };
     const bool float_path = (in.type == kTfLiteFloat32 && flt.type == kTfLiteFloat32 &&
@@ -553,8 +563,8 @@ static bool analyze_conv(const TfLiteRegistration *reg, const TfLiteNode *node,
     // general conv: validate the MATERIALIZED descriptor (the SAME/VALID pad is
     // folded into a larger zero-haloed input, so the driver runs pad_top=pad_left=0)
     // through the driver's pure planner, and confirm it reproduces TFLite's dims. For
-    // depthwise this is also the IC%G + single-CBUF-pass gate (a DW layer too big for
-    // one pass returns <0 -> CPU fallback, since the driver has no DW spatial tiling).
+    // depthwise this is also the IC%G gate; the driver tiles a depthwise over channels and,
+    // past one CBUF pass, over output rows and columns (dw_spatial).
     const int tot_h = rocket_total_pad(IH, KH, sy, dy, OH);
     const int tot_w = rocket_total_pad(IW, KW, sx, dx, OW);
     rocket_conv2d_desc d = {};
@@ -835,7 +845,8 @@ struct Node {
     SplitP     split;
 };
 
-// ADD: elementwise residual, SAME shape only (broadcast -> CPU). float | int8 | uint8.
+// ADD: elementwise residual, same shape or broadcast (each input must broadcast to the
+// output; eval_add materializes it). float | int8 | uint8.
 static bool analyze_add(const TfLiteNode *node, TfLiteContext *ctx, Node *out) {
     const auto *p = reinterpret_cast<const TfLiteAddParams *>(node->builtin_data);
     if (!p) return false;
@@ -866,7 +877,7 @@ static bool analyze_add(const TfLiteNode *node, TfLiteContext *ctx, Node *out) {
     return true;
 }
 
-// MAXIMUM / MINIMUM: elementwise two-tensor, SAME shape only (broadcast -> CPU).
+// MAXIMUM / MINIMUM: elementwise two-tensor, same shape or broadcast (as ADD).
 // No fused-activation param (the op is the whole node). float | int8 | uint8.
 // Shares NodeKind::Add / AddP, distinguished by AddP.op (ROCKET_BINOP_MAX/MIN).
 static bool analyze_binary(const TfLiteRegistration *reg, const TfLiteNode *node,
@@ -902,7 +913,7 @@ static bool analyze_binary(const TfLiteRegistration *reg, const TfLiteNode *node
     return true;
 }
 
-// MUL / SUB / DIV: elementwise two-tensor, SAME shape only (broadcast -> CPU), WITH a
+// MUL / SUB / DIV: elementwise two-tensor, same shape or broadcast (as ADD), WITH a
 // fused activation (like ADD). float | int8 | uint8. Shares NodeKind::Add / AddP,
 // distinguished by AddP.op (ROCKET_ARITH_MUL/SUB/DIV); eval_add routes these to the
 // fused-act arithmetic host kernel. SUB/DIV are non-commutative: in0 op in1.
@@ -2257,6 +2268,7 @@ public:
             }
             const auto t0 = std::chrono::steady_clock::now();
             TfLiteStatus st = kTfLiteOk;
+            npu_ran_ = false;
             switch (n.kind) {
             case NodeKind::Conv:
                 if (!n.conv.packed && pack_weights(context, n.conv) != kTfLiteOk) {
@@ -2290,10 +2302,9 @@ public:
                             ? (n.conv.depthwise ? "dwconv" : "conv") : node_op_name(n));
                 return st;
             }
-            // A conv reaches the CPU oracle only when no device opened; every other op runs
-            // where its location tag says.
-            const bool on_npu = (n.kind == NodeKind::Conv && fd_ >= 0) ||
-                                strncmp(node_loc_tag(n), "(npu", 4) == 0;
+            // A conv reaches the CPU oracle only when no device opened; every other op counts
+            // as NPU work only if its route returned the result from the device.
+            const bool on_npu = (n.kind == NodeKind::Conv && fd_ >= 0) || npu_ran_;
             (on_npu ? g_rocket_ops_npu : g_rocket_ops_host)++;
             op_i++;
             if (opts_.profile) {
@@ -2305,7 +2316,7 @@ public:
                             n.conv.KH, n.conv.KW, n.conv.IC, n.conv.OC, n.conv.sy, n.conv.sx, ms);
                 else
                     fprintf(stderr, "[rocket] %s %s  %.3f ms\n", node_op_name(n),
-                            node_loc_tag(n), ms);
+                            npu_ran_ ? "(npu)" : "(host)", ms);
             }
         }
         return kTfLiteOk;
@@ -2327,7 +2338,7 @@ private:
 
     // Will this native int8/uint8 1x1 conv run on the resident int8 matmul at M=IH*IW?
     // A 1x1 stride-1 (no dilation) native int8 (c.native) or uint8 (c.native_u8) DIRECT
-    // conv whose M meets the matmul's M%4||M==1 alignment. K (IC) and N (OC) are zero-padded
+    // conv whose M meets the matmul's M%4 alignment. K (IC) and N (OC) are zero-padded
     // to %32, so only M gates here (a 5x5/3x3 SSD-head feature with M=25/9 stays on the
     // conv path — tiny, ~14M of the 588M 1x1 MACs). Decided in Prepare; Eval routes on mm_w_i8.
     // A 1x1 the int8-out direct writer takes (u8_i8out, i8_perc) leaves the matmul when its
@@ -2337,7 +2348,7 @@ private:
         if (pw_min_m > 0 && M >= pw_min_m && (c.u8_i8out || c.i8_perc)) return false;
         return (c.native || c.native_u8) &&
                c.KH == 1 && c.KW == 1 && c.sy == 1 && c.sx == 1 &&
-               c.dy == 1 && c.dx == 1 && (M % 4 == 0 || M == 1) && M >= 1;
+               c.dy == 1 && c.dx == 1 && M % 4 == 0 && M >= 4;
     }
 
     static const char *node_kind_name(NodeKind k) {
@@ -2390,13 +2401,16 @@ private:
         return node_kind_name(n.kind);
     }
 
-    // Where a (non-conv) aux op runs, for the profile line. Everything is a host kernel
-    // except a unary activation under act_npu with a device (the on-NPU DPU LUT path).
+    // The route a (non-conv) node is planned to take, for the profile line printed before
+    // it runs. A shape check inside the eval can still send it to the host; the count reads
+    // npu_ran_.
     const char *node_loc_tag(const Node &n) const {
-        if (n.kind == NodeKind::Act && opts_.act_npu && fd_ >= 0) return "(npu-lut)";
-        if (n.kind == NodeKind::Pool && opts_.pool_npu && fd_ >= 0) return "(npu-ppu)";
-        if (n.kind == NodeKind::Add && n.add.op != -1 && opts_.ew_npu && fd_ >= 0 &&
-            !n.add.is_quant) return "(npu-ew)";
+        if (n.kind == NodeKind::Act && opts_.act_npu && fd_ >= 0 &&
+            unary_to_rocket_act(n.unary.kind) >= 0) return "(npu-lut)";
+        if (n.kind == NodeKind::Pool && opts_.pool_npu && fd_ >= 0 &&
+            !n.pool.is_quant) return "(npu-ppu)";
+        if (n.kind == NodeKind::Add && opts_.ew_npu && fd_ >= 0 && !n.add.is_quant &&
+            (n.add.op == ROCKET_BINOP_MAX || n.add.op == ROCKET_BINOP_MIN)) return "(npu-ew)";
         if (n.kind == NodeKind::Prelu && opts_.act_npu && fd_ >= 0 &&
             !n.prelu.is_quant) return "(npu-ew)";
         if (n.kind == NodeKind::Reduce && opts_.pool_npu && fd_ >= 0 &&
@@ -2640,7 +2654,7 @@ private:
         //     positions; the NHWC input is already A row-major and C is already NHWC, so no
         //     transpose on either side, and the matmul fans the OUTPUT columns across the 3
         //     cores (the single-tile conv path pins them to ONE). mm_w_i8 is non-null only when
-        //     Prepare packed this conv's int8 weights for the current M (1x1, M%4||M==1, device
+        //     Prepare packed this conv's int8 weights for the current M (1x1, M%4, device
         //     present, scratch free). The int8 accumulate is exact + order-independent: the matmul
         //     and the conv path are both bit-exact to the int64 reference == CPU TFLite and
         //     deterministic across worker counts (tests/mm_vs_conv_acc.c, tests/mm_nt_det.c), so
@@ -3158,6 +3172,7 @@ private:
                     : rocket_ew_max_fp16(fd_, fa.data(), fb.data(), fo.data(), (int)n);
                 if (rc == 0) {
                     for (long i = 0; i < n; i++) o.data.f[i] = (float)fo[i];
+                    npu_ran_ = true;
                     return kTfLiteOk;
                 }
                 if (opts_.profile) fprintf(stderr, "[rocket]   ew_npu failed -> host kernel\n");
@@ -3234,6 +3249,7 @@ private:
                             for (int c = 0; c < C; c++)
                                 dst[((size_t)oh * OW + ow) * C + c] =
                                     rocket_apply_act((float)b[((size_t)c * OH + oh) * OW + ow], x.act);
+                    npu_ran_ = true;
                     return kTfLiteOk;
                 }
             }
@@ -3417,6 +3433,7 @@ private:
                     if (run_npu(a.data(), b.data()) == 0) {
                         float *dst = o.data.f;
                         for (long i = 0; i < n; i++) dst[i] = (float)b[i];
+                        npu_ran_ = true;
                         return kTfLiteOk;
                     }
                 } else {
@@ -3429,6 +3446,7 @@ private:
                         for (long i = 0; i < n; i++)
                             rocket_qwrite(o.data.data, i,
                                 rocket_rq1((float)b[i], inv, x.out_zp, qmin, qmax), x.out_uns);
+                        npu_ran_ = true;
                         return kTfLiteOk;
                     }
                 }
@@ -3509,6 +3527,7 @@ private:
             for (long i = 0; i < n; i++) a[i] = (_Float16)in.data.f[i];
             if (rocket_l2norm_fp16(fd_, x.M, x.C, a.data(), 1e-12f, b.data()) == 0) {
                 for (long i = 0; i < n; i++) o.data.f[i] = (float)b[i];
+                npu_ran_ = true;
                 return kTfLiteOk;
             }
             if (opts_.profile) fprintf(stderr, "[rocket]   norm_npu failed -> host kernel\n");
@@ -3574,6 +3593,7 @@ private:
                     for (int p = 0; p < OH * OW; p++)
                         for (int c = 0; c < C; c++)
                             dst[(size_t)p * C + c] = (float)b[(size_t)c * OH * OW + p];
+                    npu_ran_ = true;
                     return kTfLiteOk;
                 }
             }
@@ -3624,6 +3644,7 @@ private:
                    :                              rocket_global_minpool_fp16(fd_, C, H, W, a.data(), b.data());
             if (rc == 0) {
                 for (int c = 0; c < C; c++) o.data.f[c] = (float)b[c];
+                npu_ran_ = true;
                 return kTfLiteOk;
             }
             if (opts_.profile) fprintf(stderr, "[rocket]   reduce_npu failed -> host kernel\n");
@@ -3674,6 +3695,7 @@ private:
                 for (int s = 0; s < S; s++)
                     for (int c = 0; c < C; c++)
                         dst[(size_t)s * C + c] = (float)yt[(size_t)c * S + s];
+                npu_ran_ = true;
                 return kTfLiteOk;
             }
             if (opts_.profile) fprintf(stderr, "[rocket]   prelu_npu failed -> host kernel\n");
@@ -3719,6 +3741,7 @@ private:
                     float v = (float)C[(size_t)m * Npad + nn] + (bias ? bias[nn] : 0.f);
                     o.data.f[(size_t)m * N + nn] = rocket_apply_act(v, f.act);
                 }
+            npu_ran_ = true;
             return kTfLiteOk;
         }
 
@@ -3736,6 +3759,7 @@ private:
     std::vector<std::vector<_Float16>> resident_buf_;  // fp16-NCHW storage, parallel to resident_idx_
     int  fd_ = -1;
     bool opened_ = false;
+    bool npu_ran_ = false;                // the node being evaluated returned from the NPU
     rocket_ctx *mm_ctx_ = nullptr;        // persistent fp16 matmul worker fds + scratch (1x1 path)
     rocket_i8_ctx *mm_i8_ctx_ = nullptr;  // persistent int8 matmul worker fds (native 1x1 int8/uint8)
     rocket_conv_ctx *conv_ctx_ = nullptr; // resident conv BOs on fd_ (general/dw conv path)
@@ -3953,6 +3977,7 @@ TfLiteDelegate *tflite_plugin_create_delegate(
         else if (k == "resize_npu")    opts.resize_npu    = (rocket_opt_long("resize_npu", v, 0) != 0);
         else if (k == "norm_npu")      opts.norm_npu      = (rocket_opt_long("norm_npu", v, 0) != 0);
         else if (k == "rk3576")        opts.rk3576_graph  = (rocket_opt_long("rk3576", v, 1) != 0);
+        else fprintf(stderr, "[rocket] option '%s' is not a delegate option; ignored\n", k.c_str());
     }
     if (opts.nthreads < 1) opts.nthreads = 1;
     if (opts.nthreads > 8) opts.nthreads = 8;

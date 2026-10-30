@@ -6,10 +6,11 @@
  * export them.
  *
  * The delegate .so is headers-only: it expects TfLiteIntArrayCreate/Free to bind
- * at dlopen from the host interpreter (exactly like Mesa's libteflon.so). The
- * classic `tflite_runtime` / full `tensorflow` wheels export these as global
- * dynamic symbols, so the delegate resolves them with no help. LiteRT
- * (`ai_edge_litert`, the only wheel on recent Python) hides them, so the dlopen
+ * at dlopen from the host interpreter (as Mesa's libteflon.so does). Under Python
+ * neither wheel makes them visible to it. LiteRT (`ai_edge_litert`, the only wheel
+ * on recent Python) does not export them, and `tflite_runtime` loads its C
+ * extension RTLD_LOCAL, so its copies are not in the global scope either (the
+ * Frigate image needed the shim for that reason). Without the shim the dlopen
  * fails with `undefined symbol: TfLiteIntArrayCreate`.
  *
  * Build this as a tiny shared object and LD_PRELOAD it before the interpreter:
