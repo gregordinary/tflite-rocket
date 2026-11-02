@@ -63,7 +63,7 @@ a newer libstdc++ than bookworm's, the build fails.
 
 ```bash
 # 1. Build the delegate and the C-API shim on the RK3588 host, portable to the image's glibc.
-#    librocketnpu is already built and installed at /usr/local, per ../README.md.
+#    librocketnpu builds from the rocket-userspace checkout beside this project, per ../README.md.
 cmake -S .. -B ../build -DTFLITE_DIR=/path/to/tflite/headers \
       -DTFLITE_ROCKET_PORTABLE_GLIBC=ON
 cmake --build ../build -j -t tflite_rocket tflite_cshim
@@ -122,9 +122,9 @@ model:
 
 ## Multi-camera throughput
 
-One warm MobileDet stream does not reach video rate. Throughput comes from running several
-detectors at once, one per A76 core. Frigate runs one process per configured detector, so pin
-each to a distinct core:
+One warm MobileDet detector runs about 19 inferences a second on `performance` (51.4 ms each).
+Throughput past that comes from running several detectors at once, one per A76 core. Frigate
+runs one process per configured detector, so pin each to a distinct core:
 
 ```yaml
 detectors:
@@ -134,7 +134,8 @@ detectors:
   rocket3: { type: rocket, num_threads: 1, device: "7" }
 ```
 
-A pool of these four detectors served four cameras:
+A pool of these four detectors served four SSD-MobileDet cameras, on a build whose single
+inference took ~336 ms:
 
 | Detectors | Aggregate `detection_fps` | Scaling |
 |---:|---:|---:|
@@ -143,18 +144,21 @@ A pool of these four detectors served four cameras:
 | 3 | 8.00 | 2.50x |
 | 4 | 9.55 | 2.98x |
 
-**Conditions:** RK3588 (Turing RK1), NPU at ~816 MHz (the 600 MHz request), NPU IRQs pinned to
-the big cores, measured live on 2026-07-01. A single inference took ~336 ms on that build.
+**Conditions:** RK3588 (Turing RK1), the mainline `rocket` driver, NPU at ~816 MHz (the 600 MHz
+request), `num_threads: 1` per detector, NPU IRQs pinned to the big cores, measured live on
+2026-07-01.
 
-**Not characterized:** the live pool at the delegate's current 51.4 ms single stream. Outside
-Frigate, four delegate processes on SSDLite-MobileDet, one per A76 core, measured 3.33-3.51x one
-process's rate [HW sweep 2026-10-29]. The NPU ran at 928 MHz (the 900 MHz request).
+**Not characterized:** the live pool at the delegate's current 51.4 ms single stream.
+
+Outside Frigate, four delegate processes on SSDLite-MobileDet, one per A76 core, measured
+3.33-3.51x one process's rate on the current build. The NPU ran at 928 MHz (the 900 MHz request)
+[HW sweep 2026-10-29].
 
 Each detector ran on its own A76 core, the four at ~73% busy, while the Cortex-A55 cores handled
-video decode. Without Frigate, the delegate on a test unit whose cost is the submit scales to
-3.56x at four processes (`../tools/pool_throughput.py`). The live pool scaled less, because that
-build's inference was bound by the host's cube packing and gathering rather than by the submit.
-Per-inference latency rose from 338 to 424 ms as the four contexts contended for DRAM bandwidth.
+video decode. The live pool scaled below a test unit whose cost is the submit, which reaches
+3.56x at four processes. That build's inference was bound by the host's cube packing and
+gathering rather than by the submit. Per-inference latency rose from 338 to 424 ms as the four
+contexts contended for DRAM bandwidth.
 
 For the best result, pin the NPU IRQs to the big cores with `rocket-userspace`'s
 `tools/npu_set_irq_affinity.sh throughput`.
