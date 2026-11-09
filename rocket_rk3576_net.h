@@ -347,7 +347,10 @@ inline bool kind_supported(const TfLiteRegistration *reg, const TfLiteNode *node
         pd.method = reg->builtin_code == kTfLiteBuiltinAveragePool2d ? POOL_METHOD_AVG
                                                                     : POOL_METHOD_MAX;
         pd.avg_exclude_pad = pd.method == POOL_METHOD_AVG ? 1 : 0;
-        return rocket_pool_int8_rk3576_plan(&pd) == ROCKET_OK;
+        // AND THE DRIVER'S: the plan touches no hardware, and a driver without the PPU
+        // completion retires every pool at its 500 ms job timeout with a core reset. The
+        // upstream RK3576 series is one. Declining here costs one node TFLite runs itself.
+        return rocket_pool_int8_rk3576_plan(&pd) == ROCKET_OK && rocket_pool_npu_supported();
     }
     case kTfLiteBuiltinAdd: {
         if (node->inputs->size != 2) return false;

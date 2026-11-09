@@ -14,8 +14,8 @@ EW residual of a conv). So the minimal capturable graph is a residual:
 
 Teflon emits conv_a, then conv_b WITH add_tensor = conv_a.output → the conv_b
 regcmd carries the EW-add operand path (DPU_EW_CFG EW_ALU_ALGO=add + EW_OP_SRC,
-the DPU_RDMA ERDMA_CFG / EW_BASE_ADDR / SURF_NOTCH / COMB_USE) that we need to
-diff against gen_ew_mul_fp16. Full INT8, per-tensor (Teflon rejects per-axis).
+the DPU_RDMA ERDMA_CFG / EW_BASE_ADDR / SURF_NOTCH / COMB_USE) to diff against a
+DPU-only EW program. Full INT8, per-tensor (Teflon rejects per-axis).
 
     python3 make_add_tflite.py                 # add_c8_4x4.tflite
     python3 make_add_tflite.py --c 8 --hw 4

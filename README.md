@@ -170,6 +170,10 @@ On the RK3576 the delegate claims `CONV_2D`, `DEPTHWISE_CONV_2D`, `AVERAGE_POOL_
 int8 or uint8. The CPU runs everything else. Inside a partition every tensor is CHW int8, so a
 fully linked graph transposes only at the partition's two boundaries.
 
+The two pools are claimed only on a `rocket` driver with the PPU-completion flag. A pooling
+program raises no DPU completion, so a driver without the flag retires each pooling job at its
+500 ms job timeout. On such a driver the delegate declines both pools and the CPU runs them.
+
 The gain comes from the graph, so an op-at-a-time execution cannot reach it. On the same
 MobileNetV1-224:
 
@@ -476,11 +480,13 @@ patches:
 - **[`rknpu-submit`](https://github.com/gregordinary/rknpu-submit)**: a submit provider that runs
   `librocketnpu` on the `rknpu` BSP kernel driver instead of the mainline `rocket` driver.
 - **[`patches`](https://github.com/gregordinary/patches)** (`rocket/` scope): optional out-of-tree
-  kernel-module patches for clock, voltage and IOMMU. They raise the NPU clock above its 200 MHz
-  boot default.
+  kernel-module patches for clock, voltage, IOMMU and pool completion. They raise the NPU clock
+  above its 200 MHz boot default and let a pool run on the NPU.
 
 ## License and credits
 
 `tflite-rocket` is GPL-3.0-or-later (it links the GPL-3 `rocket-userspace` driver library). It
 targets [TensorFlow Lite](https://www.tensorflow.org/lite) (Apache-2.0) as an external delegate
-and uses the `rocket-userspace` driver for the NPU.
+and uses the `rocket-userspace` driver for the NPU. The Frigate detector plugin and Compose file
+follow Frigate's (MIT) detector plugins and documentation, and
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) carries Frigate's license notice.

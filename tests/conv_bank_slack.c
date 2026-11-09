@@ -115,7 +115,7 @@ int main(void)
     if (fd < 0) { printf("no NPU (%d)\n", fd); return 2; }
 
     /* DEFAULTS = the decisive regression gate: IW=1 makes the conv feature DMA identical
-     * to gen_matmul_int8's (datain_width=1), so the matmul's near-bank-full resonance is
+     * to gen_gemm_int8's (datain_width=1), so the matmul's near-bank-full resonance is
      * reachable here. With the fix this PASSES; reverting it (ROCKET_CONV_I8_FDBANK_EXTRA=-1)
      * FAILS. Env vars override for broad exploration (IW=2/4, KxK, UINT8, other IC/IH). */
     int IW      = geti("IW", 1);

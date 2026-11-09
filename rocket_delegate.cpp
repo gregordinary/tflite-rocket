@@ -2408,13 +2408,13 @@ private:
         if (n.kind == NodeKind::Act && opts_.act_npu && fd_ >= 0 &&
             unary_to_rocket_act(n.unary.kind) >= 0) return "(npu-lut)";
         if (n.kind == NodeKind::Pool && opts_.pool_npu && fd_ >= 0 &&
-            !n.pool.is_quant) return "(npu-ppu)";
+            !n.pool.is_quant && rocket_pool_npu_supported()) return "(npu-ppu)";
         if (n.kind == NodeKind::Add && opts_.ew_npu && fd_ >= 0 && !n.add.is_quant &&
             (n.add.op == ROCKET_BINOP_MAX || n.add.op == ROCKET_BINOP_MIN)) return "(npu-ew)";
         if (n.kind == NodeKind::Prelu && opts_.act_npu && fd_ >= 0 &&
             !n.prelu.is_quant) return "(npu-ew)";
         if (n.kind == NodeKind::Reduce && opts_.pool_npu && fd_ >= 0 &&
-            !n.reduce.is_quant) return "(npu-ppu)";
+            !n.reduce.is_quant && rocket_pool_npu_supported()) return "(npu-ppu)";
         if (n.kind == NodeKind::Resize && opts_.resize_npu && fd_ >= 0 &&
             !n.resize.is_quant && !n.resize.bilinear) return "(npu)";
         if (n.kind == NodeKind::L2Norm && opts_.norm_npu && fd_ >= 0 &&
@@ -3225,8 +3225,10 @@ private:
         // average diverges (MAX with pad is fine: the PPU -inf pad fill never wins ==
         // clamp-to-image). rocket_pool_fp16_plan rejects pad>7 (3-bit field). Any failure
         // falls back to the exact host kernel below. NHWC<->CHW transpose makes this a
-        // demonstration/coverage path until partitions stay cube-resident.
-        if (opts_.pool_npu && fd_ >= 0 && !x.is_quant) {
+        // demonstration/coverage path until partitions stay cube-resident. A driver without
+        // the PPU completion would retire each pool at its 500 ms job timeout, so
+        // rocket_pool_npu_supported() keeps it on the host there.
+        if (opts_.pool_npu && fd_ >= 0 && !x.is_quant && rocket_pool_npu_supported()) {
             const int pt = tot_h / 2, pb = tot_h - tot_h / 2;
             const int pl = tot_w / 2, pr = tot_w - tot_w / 2;
             const bool avg_ok = !x.is_avg || (tot_h == 0 && tot_w == 0);
@@ -3633,7 +3635,8 @@ private:
         if (!in.data.data || !o.data.data) return kTfLiteError;
         const int H = x.H, W = x.W, C = x.C;
 
-        if (opts_.pool_npu && fd_ >= 0 && !x.is_quant && rocket_global_avgpool_plan(C, H, W) == 0) {
+        if (opts_.pool_npu && fd_ >= 0 && !x.is_quant && rocket_global_avgpool_plan(C, H, W) == 0 &&
+            rocket_pool_npu_supported()) {
             std::vector<_Float16> a((size_t)C * H * W), b((size_t)C);
             const float *src = in.data.f;                       // NHWC (p*C+c) -> [C][H*W]
             for (int p = 0; p < H * W; p++)

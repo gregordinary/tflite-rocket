@@ -15,9 +15,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p media && cd media
 
-# Two stock images with people/vehicles (override BG_URL / FG_URL to use your own).
-BG_URL="${BG_URL:-https://raw.githubusercontent.com/ultralytics/ultralytics/main/ultralytics/assets/bus.jpg}"
-FG_URL="${FG_URL:-https://raw.githubusercontent.com/ultralytics/ultralytics/main/ultralytics/assets/zidane.jpg}"
+# Two Wikimedia Commons images (override BG_URL / FG_URL to use your own):
+#   background  "Market-street-kearny-street-bus.jpg", User:Firstcultural, CC0 1.0
+#   foreground  "Couple walking dog at Buckingham Fountain.jpg", public domain
+# https://commons.wikimedia.org/wiki/File:<name> has each file's page.
+COMMONS=https://commons.wikimedia.org/wiki/Special:FilePath
+BG_URL="${BG_URL:-$COMMONS/Market-street-kearny-street-bus.jpg?width=1280}"
+FG_URL="${FG_URL:-$COMMONS/Couple_walking_dog_at_Buckingham_Fountain.jpg?width=1280}"
 [ -f bg.jpg ] || curl -fsSL -o bg.jpg "$BG_URL"
 [ -f fg.jpg ] || curl -fsSL -o fg.jpg "$FG_URL"
 
