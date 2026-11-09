@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The tflite-rocket authors
 //
 // boxsum_bench — host microbench + cross-mode bit-identity gate for the native-uint8

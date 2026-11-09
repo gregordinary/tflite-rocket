@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The tflite-rocket authors
 """Read the delegate's process-wide counts, so a harness can assert that the delegate ran.
 

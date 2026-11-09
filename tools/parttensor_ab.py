@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Where does a delegated graph first depart from CPU TFLite?
 
 A model-level score says a graph is wrong; it does not say WHERE. Every tensor a

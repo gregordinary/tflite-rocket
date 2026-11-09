@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """mm_ab.py — A/B for the int8/uint8 1x1->matmul routing (perf Step 1).
 
 Two checks:

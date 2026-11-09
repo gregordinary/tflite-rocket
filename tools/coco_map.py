@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # COCO-val mAP@[.5:.95] for an SSD-postprocess TFLite detector, CPU TFLite vs the rocket
 # delegate (native_int8). The model carries TFLite_Detection_PostProcess, so its 4 outputs
 # ARE detections (boxes [ymin,xmin,ymax,xmax] normalized, classes, scores, count) — no NMS.

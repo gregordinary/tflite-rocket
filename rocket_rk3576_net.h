@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The tflite-rocket authors
 //
 // rocket_rk3576_net.h — the RK3576 GRAPH path: a delegated partition run as one

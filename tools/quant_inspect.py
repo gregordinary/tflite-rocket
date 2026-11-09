@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Dump per-conv quantization params (dtype, zero-points, per-tensor vs per-axis
 weight quant) for a TFLite model. Decides the uint8-native design: are the conv
 weight zero-points symmetric (==128 in uint8 / ==0 in int8) or asymmetric?"""

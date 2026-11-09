@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The tflite-rocket authors
 """
 make_ssd_head_tflite.py — emit an SSD-style detection HEAD: parallel 1x1 CONV_2D

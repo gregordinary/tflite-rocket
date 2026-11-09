@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Does the fp16 matmul resonate at the SAME (Mtile,Ktile) the int8 path corrupts?
 // fp16 uses a C2=8, 2-byte feature cube; int8 uses C2=16, 1-byte. If fp16 is CLEAN at
 // M=144,K=672 (where int8 corrupts the last rows), the bug is int8-cube-specific.

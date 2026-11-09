@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Localize the matmul-vs-conv 1x1 discrepancy: run the SAME int8 1x1 as (a) rocket_conv2d_int8
 // and (b) rocket_matmul_int8_prepacked, compare both to an EXACT int64 reference C[m,oc]=sum_c
 // A[m,c]*B[oc,c]. Tells us which path (if any) deviates, and whether it's nt-dependent.

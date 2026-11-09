@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // mm_nt_det.c — does the resident int8 matmul depend on worker count (nt)?
 // For each (M,IC,OC) routed 1x1 shape: pad K/N to %32, run rocket_matmul_int8_prepacked
 // at nt=1,2,3,4, compare EVERY result to the exact int64 reference AND to the nt=1 result.

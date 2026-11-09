@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The tflite-rocket authors
 """
 make_seq_tflite.py — emit a small  conv -> {LOG | LOG_SOFTMAX | CUMSUM} -> conv .tflite

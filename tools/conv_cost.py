@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Per-DIRECT-conv box-sum vs requant cost model for the native-uint8 path.
 box-sum work ~ OH*OW*IC*KH*KW (adds, only when w_zp asymmetric).
 requant work ~ OH*OW*OC. Channel-reduce+separable box-sum ~ IC*IHp*IWp + IHp*OW*KW + OH*OW*KH."""

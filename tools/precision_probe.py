@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # precision-vs-bug probe: build ONE model (fixed seed), emit a paired float and
 # int8 tflite with IDENTICAL weights, then ask whether nchw_resident=1 (fp16-NCHW
 # inter-op, skips int8 requant) lands CLOSER to the fp32 ground truth than pure int8

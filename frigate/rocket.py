@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The tflite-rocket authors
 """
 rocket.py — Frigate detector plugin for the RK3588 NPU via the tflite-rocket

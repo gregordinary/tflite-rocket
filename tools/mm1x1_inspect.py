@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Enumerate the 1x1 stride-1 CONV_2D ops in a TFLite model and report whether each
 is alignment-eligible for the resident int8 matmul (K=IC%32==0, N=OC%32==0, M%4||M==1,
 where M = IH*IW). Tells us how many of the single-tile 1x1 convs route to the matmul

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 The tflite-rocket authors
 """
 make_resize_tflite.py — emit a  conv -> RESIZE_{NEAREST_NEIGHBOR|BILINEAR} -> conv .tflite.

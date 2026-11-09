@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Bisect the int8-conv large-feature-cube bug. Probe SINGLE-JOB 1x1 int8 convs
 // (feature <= budget so rocket_conv2d_int8 fast-paths == one CNA pass, no tiling)
 // across (IC, IH, IW) to find the exact breaking threshold + which axis triggers

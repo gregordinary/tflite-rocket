@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Conv int8 CBUF feature-bank-slack resonance sweep — the conv analog of mm_nt_det.c.
 //
 // AUDIT: gen_conv2d_int8_fill (npu_regcmd.c) sets data_bank = ceil(feat_bytes/32KB),

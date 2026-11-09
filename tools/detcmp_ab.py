@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """A/B: how well does each delegate path track CPU TFLite on a real image?
 Runs CPU (reference), delegate native-u8 (native_int8=1), delegate fp16-approx
 (native_int8=0), and for each delegate matches CPU detections (score>0.30) to the

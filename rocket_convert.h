@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 The tflite-rocket authors
 #ifndef ROCKET_CONVERT_H
 #define ROCKET_CONVERT_H

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # End-to-end smoke test for the tflite-rocket delegate's on-NPU pooling (pool_npu).
 # Builds tiny float TFLite pool models, runs each (a) plain on the CPU interpreter and
 # (b) through libtflite_rocket.so with pool_npu=1, and compares. With profile=1 the
