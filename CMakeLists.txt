@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The tflite-rocket authors
 # tflite-rocket — TFLite external delegate for the RK3588 NPU (rocket).
 # Links the standalone rocket-userspace driver library.
 #

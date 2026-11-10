@@ -14,7 +14,7 @@ The model's CONV_2D, DEPTHWISE_CONV_2D and ADD ops are walked in execution order
 TFLite's reference kernels (BUILTIN_REF, every tensor preserved) supply the oracle input and
 output. Every conv runs under several requant ARMS:
 
-  tfl   TFLite's own arithmetic re-implemented here (Q31 multiplier, gemmlowp rounding).
+  tfl   TFLite's own arithmetic re-implemented here (a 31-bit multiplier, rounded twice).
         Applied to TFLite's input it must reproduce TFLite's output exactly on every layer;
         that is the check that this script's accumulator, padding and requant are right. On
         the two uint8 detectors it does on every layer but three, where 1-4 elements of a
@@ -72,47 +72,48 @@ from ai_edge_litert.interpreter import Interpreter, OpResolverType
 ARMS = ("tfl", "exact", "even", "away", "m16")
 
 
-# ---- TFLite's fixed-point arithmetic ---------------------------------------------------------
-def quantize_multiplier(m):
-    """TFLite QuantizeMultiplier: (int32 Q31 multiplier, shift), m = q * 2^shift."""
+# ---- fixed-point arithmetic ------------------------------------------------------------------
+# Every arm is an integer product rounded back down to an output code. The arms differ only in
+# the multiplier's width, where the product is rounded and how a tie breaks, so each of those is
+# one helper here and an arm is a choice among them.
+def fixed_point(m, bits):
+    """The non-negative real m as a `bits`-wide mantissa and a right shift, m ~= mant / 2^e with
+    mant in [2^(bits-1), 2^bits), rounded to nearest with a tie up. Zero is (0, bits)."""
     if m == 0.0:
-        return 0, 0
-    q, shift = math.frexp(m)
-    qf = int(math.floor(q * (1 << 31) + 0.5))   # TfLiteRound: half away from zero, q > 0
-    if qf == (1 << 31):
-        qf //= 2
-        shift += 1
-    if shift < -31:
-        return 0, 0
-    return qf, shift
+        return 0, bits
+    frac, exp = math.frexp(m)                    # m = frac * 2^exp, frac in [0.5, 1)
+    mant = math.floor(math.ldexp(frac, bits) + 0.5)
+    e = bits - exp
+    if mant == 1 << bits:                        # frac rounded up to 1: renormalize
+        mant, e = mant >> 1, e - 1
+    return mant, e
 
 
-def _trunc_div(v, d):
-    return np.where(v >= 0, v // d, -((-v) // d))
+def round_shift(p, shift, tie):
+    """p / 2^shift rounded to the nearest integer, a tie broken toward +inf ("up"), away from
+    zero ("away") or to the even neighbour ("even"). p is an int64 array."""
+    if shift == 0:
+        return p
+    half = np.int64(1 << (shift - 1))
+    v = (p + half) >> shift                      # nearest, a tie up
+    tied = (p & np.int64((1 << shift) - 1)) == half
+    if tie == "away":
+        v = v - (tied & (p < 0)).astype(np.int64)
+    elif tie == "even":
+        v = v - (tied & ((v & 1) == 1)).astype(np.int64)
+    elif tie != "up":
+        raise ValueError(tie)
+    return v
 
 
-def srdhm(a, b):
-    """gemmlowp SaturatingRoundingDoublingHighMul(a, b), a int64 array in int32 range."""
-    ab = a.astype(np.int64) * np.int64(b)
-    nudge = np.where(ab >= 0, np.int64(1 << 30), np.int64(1 - (1 << 30)))
-    return _trunc_div(ab + nudge, np.int64(1 << 31))
-
-
-def rdbpot(x, e):
-    """gemmlowp RoundingDivideByPOT."""
-    if e == 0:
-        return x
-    mask = np.int64((1 << e) - 1)
-    rem = x & mask
-    thr = (mask >> 1) + (x < 0).astype(np.int64)
-    return (x >> e) + (rem > thr).astype(np.int64)
-
-
-def mbqm(x, mult, shift):
-    """TFLite MultiplyByQuantizedMultiplier (double rounding)."""
-    left = shift if shift > 0 else 0
-    right = -shift if shift < 0 else 0
-    return rdbpot(srdhm(x * np.int64(1 << left), mult), right)
+def tfl_scale(x, mant, e):
+    """x * mant / 2^e with a 31-bit mantissa, rounded the way TFLite's integer kernels round it:
+    once at bit 31 of the product with a tie up, then again over the remaining e - 31 bits with
+    a tie away from zero. A multiplier of 1 or more (e < 31) scales x up by 2^(31-e) instead,
+    and only the first rounding applies."""
+    if e < 31:
+        x, e = x * np.int64(1 << (31 - e)), 31
+    return round_shift(round_shift(x * np.int64(mant), 31, "up"), e - 31, "away")
 
 
 # ---- the OUT_CVT model -------------------------------------------------------------------------
@@ -129,34 +130,17 @@ def outcvt_params(in_s, w_s, out_s):
 
 def m16_params(in_s, w_s, out_s):
     """A 16-bit multiplier rounded to nearest [expected: the SCALE field is [15:0]]."""
-    cs = float(np.float32(np.float32(in_s) * np.float32(w_s)) / np.float32(out_s))
-    e = 0
-    while cs * (2.0 ** e) < (1 << 15):
-        e += 1
-    while cs * (2.0 ** e) >= (1 << 16):
-        e -= 1
-    m = int(math.floor(cs * (2.0 ** e) + 0.5))
-    if m == (1 << 16):
-        m //= 2
-        e -= 1
-    return m, e
-
-
-def round_shift(p, shift, away):
-    if shift == 0:
-        return p
-    half = np.int64(1 << (shift - 1))
-    v = (p + half) >> shift
-    rem = p & np.int64((1 << shift) - 1)
-    tie = rem == half
-    if away:
-        v = v - (tie & (p < 0)).astype(np.int64)
-    else:
-        v = v - (tie & ((v & 1) == 1)).astype(np.int64)
-    return v
+    return fixed_point(float(np.float32(np.float32(in_s) * np.float32(w_s)) / np.float32(out_s)), 16)
 
 
 # ---- the accumulator ---------------------------------------------------------------------------
+def same_pads(n_in, n_out, k, s):
+    """SAME's (before, after) padding on one axis: how far the last window overhangs the
+    input, split with the odd pixel after."""
+    over = max((n_out - 1) * s + k - n_in, 0)
+    return over // 2, over - over // 2
+
+
 def same_or_valid(ih, iw, oh, ow, kh, kw):
     """Every (stride, pads) the shapes allow, SAME first, then VALID, strides 1..3. More than
     one can fit (5x5 -> 3x3 at k3 is VALID s1 or SAME s2); the caller keeps the one under which
@@ -170,9 +154,7 @@ def same_or_valid(ih, iw, oh, ow, kh, kw):
                 eh, ew = -(-(ih - kh + 1) // s), -(-(iw - kw + 1) // s)
             if (eh, ew) == (oh, ow):
                 if mode == "SAME":
-                    ph = max((oh - 1) * s + kh - ih, 0)
-                    pw = max((ow - 1) * s + kw - iw, 0)
-                    out.append((s, (ph // 2, ph - ph // 2, pw // 2, pw - pw // 2)))
+                    out.append((s, same_pads(ih, oh, kh, s) + same_pads(iw, ow, kw, s)))
                 else:
                     out.append((s, (0, 0, 0, 0)))
     if not out:
@@ -213,11 +195,11 @@ def requant(acc, arm, q):
     """acc -> uint8 under one arm. q: dict of the layer's quant parameters."""
     zo, lo, hi = q["zo"], q["act_lo"], q["act_hi"]
     if arm == "tfl":
-        v = mbqm(acc, q["tfl_m"], q["tfl_s"]) + zo
+        v = tfl_scale(acc, q["tfl_m"], q["tfl_e"]) + zo
     elif arm in ("even", "away"):
-        v = round_shift(acc * np.int64(q["cvt_m"]), q["cvt_s"], arm == "away") + zo
+        v = round_shift(acc * np.int64(q["cvt_m"]), q["cvt_s"], arm) + zo
     elif arm == "m16":
-        v = round_shift(acc * np.int64(q["m16_m"]), q["m16_s"], False) + zo
+        v = round_shift(acc * np.int64(q["m16_m"]), q["m16_s"], "even") + zo
     elif arm == "exact":
         y = acc.astype(np.float64) * q["cs64"]
         v = (np.sign(y) * np.floor(np.abs(y) + 0.5)).astype(np.int64) + zo
@@ -228,21 +210,21 @@ def requant(acc, arm, q):
 
 # ---- ADD ---------------------------------------------------------------------------------------
 def add_params(s1, s2, so):
-    left = 20
+    """TFLite's integer ADD: each input, less its zero point, is scaled up by 2^20 and then by
+    its scale over twice the larger input scale; the sum is scaled back by that over 2^20 times
+    the output scale. Each scale is a 31-bit fixed-point multiplier."""
+    up = 20
     twice = 2.0 * float(max(np.float32(s1), np.float32(s2)))
-    m1 = quantize_multiplier(float(np.float32(s1)) / twice)
-    m2 = quantize_multiplier(float(np.float32(s2)) / twice)
-    mo = quantize_multiplier(twice / ((1 << left) * float(np.float32(so))))
-    return left, m1, m2, mo
+    return (up, fixed_point(float(np.float32(s1)) / twice, 31),
+            fixed_point(float(np.float32(s2)) / twice, 31),
+            fixed_point(twice / ((1 << up) * float(np.float32(so))), 31))
 
 
 def tfl_add(a, b, qa, qb, qo, lo, hi, prm):
-    left, (m1, s1), (m2, s2), (mo, so) = prm
-    a1 = (a.astype(np.int64) - qa) * np.int64(1 << left)
-    b1 = (b.astype(np.int64) - qb) * np.int64(1 << left)
-    sa = rdbpot(srdhm(a1, m1), -s1)
-    sb = rdbpot(srdhm(b1, m2), -s2)
-    out = rdbpot(srdhm(sa + sb, mo), -so) + qo
+    up, fa, fb, fo = prm
+    a1 = tfl_scale((a.astype(np.int64) - qa) * np.int64(1 << up), *fa)
+    b1 = tfl_scale((b.astype(np.int64) - qb) * np.int64(1 << up), *fb)
+    out = tfl_scale(a1 + b1, *fo) + qo
     return np.clip(out, lo, hi).astype(np.uint8)
 
 
@@ -358,11 +340,11 @@ def main():
         ih, iw = int(td[xin]["shape"][1]), int(td[xin]["shape"][2])
         oh, ow = int(td[out]["shape"][1]), int(td[out]["shape"][2])
         cands = same_or_valid(ih, iw, oh, ow, int(w.shape[1]), int(w.shape[2]))
-        tm, ts = quantize_multiplier(float(np.float32(in_s)) * float(np.float32(w_s)) /
-                                     float(np.float32(out_s)))
+        tm, te = fixed_point(float(np.float32(in_s)) * float(np.float32(w_s)) /
+                             float(np.float32(out_s)), 31)
         cm, cs = outcvt_params(in_s, w_s, out_s)
         mm, ms = m16_params(in_s, w_s, out_s)
-        q = {"zo": zo, "tfl_m": tm, "tfl_s": ts, "cvt_m": cm, "cvt_s": cs, "m16_m": mm, "m16_s": ms,
+        q = {"zo": zo, "tfl_m": tm, "tfl_e": te, "cvt_m": cm, "cvt_s": cs, "m16_m": mm, "m16_s": ms,
              "cs64": float(np.float32(in_s)) * float(np.float32(w_s)) / float(np.float32(out_s))}
         # the geometry and the fused activation: the pair under which TFLite's own arithmetic
         # reproduces TFLite's output
@@ -383,7 +365,7 @@ def main():
             q["act_lo"], q["act_hi"] = 0, 255
             act = "UNMATCHED"
         row.update({"K": [int(w.shape[1]), int(w.shape[2])], "s": s, "act": act, "zw": zw,
-                    "cvt": [cm, cs], "m16": [mm, ms], "tflq": [tm, ts], "cs64": q["cs64"]})
+                    "cvt": [cm, cs], "m16": [mm, ms], "tflq": [tm, 31 - te], "cs64": q["cs64"]})
         if opt is not None:
             row["tflopt"] = score(opt.get_tensor(out), want)
         for a in ARMS:

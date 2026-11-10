@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The tflite-rocket authors
 # Generate media/sample.mp4 for the bring-up config: a still scene first, then a
 # person walks through.
 #

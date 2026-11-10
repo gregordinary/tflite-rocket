@@ -594,8 +594,8 @@ static inline void rocket_concat_in_q(const void *in, void *out,
 
 /* ==========================================================================
  * RESIZE / UPSAMPLE — RESIZE_NEAREST_NEIGHBOR / RESIZE_BILINEAR, NHWC, per channel
- * (FPN / decoder neck). The coordinate math mirrors TFLite's reference kernels
- * (align_corners / half_pixel_centers) so a PASS is bit-exact-vs-CPU; under resize_npu
+ * (FPN / decoder neck). The coordinate math follows TFLite's align_corners /
+ * half_pixel_centers conventions so a PASS is bit-exact-vs-CPU; under resize_npu
  * the delegate routes a float nearest resize at an integer factor, with both flags
  * false, onto the NPU (rocket_upsample_nearest_fp16). Quant is a value pass-through (resize never rescales) — int8/
  * uint8 just gather the SAME stored bytes (nearest) or lerp the dequantized values
@@ -609,40 +609,59 @@ static inline float rocket_clampf(float v, float lo, float hi)
     return v;
 }
 
-/* TFLite reference GetNearestNeighbor (resize_nearest_neighbor.h). */
-static inline int rocket_nn_src(int o, int in_size, int out_size,
-                                int align_corners, int half_pixel)
+/* One axis of a resize, resolved once per call: the ratio that maps an output index back
+ * onto the input, and the sampling convention. align_corners makes the two grids' end pixels
+ * coincide (ratio (in-1)/(out-1)); otherwise their extents do (ratio in/out). half_pixel
+ * samples at pixel centers. Resolving the ratio once takes its division out of the per-pixel
+ * loop. The float operations and their order are part of the result, since a PASS must be
+ * bit-exact against the CPU kernels, so each expression below is fixed as written. */
+typedef struct {
+    float ratio;      /* input pixels per output pixel */
+    int   n_in;       /* input extent */
+    int   corners;    /* align_corners */
+    int   centers;    /* half_pixel_centers */
+} rocket_resize_axis;
+
+static inline rocket_resize_axis rocket_resize_axis_init(int n_in, int n_out,
+                                                         int corners, int centers)
 {
-    const float scale = (align_corners && out_size > 1)
-                        ? (float)(in_size - 1) / (float)(out_size - 1)
-                        : (float)in_size / (float)out_size;
-    const float off = half_pixel ? 0.5f : 0.0f;
-    int v = align_corners ? (int)lrintf(((float)o + off) * scale - off)
-                          : (int)floorf(((float)o + off) * scale);
-    if (v > in_size - 1) v = in_size - 1;
-    if (half_pixel && v < 0) v = 0;
-    return v;
+    rocket_resize_axis a;
+    a.ratio   = (corners && n_out > 1) ? (float)(n_in - 1) / (float)(n_out - 1)
+                                       : (float)n_in / (float)n_out;
+    a.n_in    = n_in;
+    a.corners = corners;
+    a.centers = centers;
+    return a;
 }
 
-/* TFLite reference bilinear source coordinate (float, before clamp/floor). */
-static inline float rocket_bilin_src(int o, int in_size, int out_size,
-                                     int align_corners, int half_pixel)
+/* The input index a nearest resize copies to output index o. */
+static inline int rocket_resize_nearest_at(const rocket_resize_axis *a, int o)
 {
-    const float scale = (align_corners && out_size > 1)
-                        ? (float)(in_size - 1) / (float)(out_size - 1)
-                        : (float)in_size / (float)out_size;
-    float v = half_pixel ? ((float)o + 0.5f) * scale - 0.5f : (float)o * scale;
-    return v;
+    const float c = a->centers ? 0.5f : 0.0f;
+    int i = a->corners ? (int)lrintf(((float)o + c) * a->ratio - c)
+                       : (int)floorf(((float)o + c) * a->ratio);
+    if (i > a->n_in - 1) i = a->n_in - 1;
+    return (a->centers && i < 0) ? 0 : i;
+}
+
+/* The input coordinate a bilinear resize interpolates at for output index o, clamped to the
+ * input's extent. */
+static inline float rocket_resize_linear_at(const rocket_resize_axis *a, int o)
+{
+    const float x = a->centers ? ((float)o + 0.5f) * a->ratio - 0.5f : (float)o * a->ratio;
+    return rocket_clampf(x, 0.f, (float)(a->n_in - 1));
 }
 
 static inline void rocket_resize_nearest_f(const float *in, float *out,
                                            int IH, int IW, int C, int OH, int OW,
                                            int align_corners, int half_pixel)
 {
+    const rocket_resize_axis ay = rocket_resize_axis_init(IH, OH, align_corners, half_pixel);
+    const rocket_resize_axis ax = rocket_resize_axis_init(IW, OW, align_corners, half_pixel);
     for (int oh = 0; oh < OH; oh++) {
-        int ih = rocket_nn_src(oh, IH, OH, align_corners, half_pixel);
+        int ih = rocket_resize_nearest_at(&ay, oh);
         for (int ow = 0; ow < OW; ow++) {
-            int iw = rocket_nn_src(ow, IW, OW, align_corners, half_pixel);
+            int iw = rocket_resize_nearest_at(&ax, ow);
             const float *src = in  + ((size_t)ih * IW + iw) * C;
             float       *dst = out + ((size_t)oh * OW + ow) * C;
             for (int c = 0; c < C; c++) dst[c] = src[c];
@@ -654,13 +673,13 @@ static inline void rocket_resize_bilinear_f(const float *in, float *out,
                                             int IH, int IW, int C, int OH, int OW,
                                             int align_corners, int half_pixel)
 {
+    const rocket_resize_axis ay = rocket_resize_axis_init(IH, OH, align_corners, half_pixel);
+    const rocket_resize_axis ax = rocket_resize_axis_init(IW, OW, align_corners, half_pixel);
     for (int oh = 0; oh < OH; oh++) {
-        float fy = rocket_bilin_src(oh, IH, OH, align_corners, half_pixel);
-        fy = rocket_clampf(fy, 0.f, (float)(IH - 1));
+        float fy = rocket_resize_linear_at(&ay, oh);
         int y0 = (int)floorf(fy); int y1 = y0 < IH - 1 ? y0 + 1 : y0; float wy = fy - (float)y0;
         for (int ow = 0; ow < OW; ow++) {
-            float fx = rocket_bilin_src(ow, IW, OW, align_corners, half_pixel);
-            fx = rocket_clampf(fx, 0.f, (float)(IW - 1));
+            float fx = rocket_resize_linear_at(&ax, ow);
             int x0 = (int)floorf(fx); int x1 = x0 < IW - 1 ? x0 + 1 : x0; float wx = fx - (float)x0;
             const float *r00 = in + ((size_t)y0 * IW + x0) * C, *r01 = in + ((size_t)y0 * IW + x1) * C;
             const float *r10 = in + ((size_t)y1 * IW + x0) * C, *r11 = in + ((size_t)y1 * IW + x1) * C;
@@ -679,10 +698,12 @@ static inline void rocket_resize_nearest_q(const void *in, void *out,
                                            int IH, int IW, int C, int OH, int OW,
                                            int align_corners, int half_pixel, int elem_size)
 {
+    const rocket_resize_axis ay = rocket_resize_axis_init(IH, OH, align_corners, half_pixel);
+    const rocket_resize_axis ax = rocket_resize_axis_init(IW, OW, align_corners, half_pixel);
     for (int oh = 0; oh < OH; oh++) {
-        int ih = rocket_nn_src(oh, IH, OH, align_corners, half_pixel);
+        int ih = rocket_resize_nearest_at(&ay, oh);
         for (int ow = 0; ow < OW; ow++) {
-            int iw = rocket_nn_src(ow, IW, OW, align_corners, half_pixel);
+            int iw = rocket_resize_nearest_at(&ax, ow);
             memcpy((char *)out + ((size_t)oh * OW + ow) * C * elem_size,
                    (const char *)in + ((size_t)ih * IW + iw) * C * elem_size,
                    (size_t)C * elem_size);
@@ -698,13 +719,13 @@ static inline void rocket_resize_bilinear_q(const void *in, void *out,
 {
     int qmin, qmax; rocket_qrange(uns, &qmin, &qmax);
     const float inv = 1.0f / scale;
+    const rocket_resize_axis ay = rocket_resize_axis_init(IH, OH, align_corners, half_pixel);
+    const rocket_resize_axis ax = rocket_resize_axis_init(IW, OW, align_corners, half_pixel);
     for (int oh = 0; oh < OH; oh++) {
-        float fy = rocket_bilin_src(oh, IH, OH, align_corners, half_pixel);
-        fy = rocket_clampf(fy, 0.f, (float)(IH - 1));
+        float fy = rocket_resize_linear_at(&ay, oh);
         int y0 = (int)floorf(fy); int y1 = y0 < IH - 1 ? y0 + 1 : y0; float wy = fy - (float)y0;
         for (int ow = 0; ow < OW; ow++) {
-            float fx = rocket_bilin_src(ow, IW, OW, align_corners, half_pixel);
-            fx = rocket_clampf(fx, 0.f, (float)(IW - 1));
+            float fx = rocket_resize_linear_at(&ax, ow);
             int x0 = (int)floorf(fx); int x1 = x0 < IW - 1 ? x0 + 1 : x0; float wx = fx - (float)x0;
             for (int c = 0; c < C; c++) {
                 float v00 = rocket_dq1(rocket_qread(in, ((size_t)y0 * IW + x0) * C + c, uns), scale, zp);

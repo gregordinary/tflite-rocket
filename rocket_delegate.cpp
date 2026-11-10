@@ -1468,23 +1468,31 @@ static bool analyze_slice(const TfLiteNode *node, TfLiteContext *ctx, Node *out)
     return true;
 }
 
-// TFLite StridedSlice start/stop semantics (strided_slice_logic.h StartForAxis /
-// StopForAxis), reproduced so a negative- or strided-axis range resolves bit-identically
-// to the CPU reference. Inputs are longs to absorb the int-sentinel mask overrides.
-static inline long ss_clamp(long v, long lo, long hi) { return v < lo ? lo : (v > hi ? hi : v); }
-static inline long ss_start_for_axis(long start, long step, bool begin_mask, long dim) {
-    if (dim == 0) return 0;
-    if (begin_mask) start = (step > 0) ? LONG_MIN : LONG_MAX;   // first / last element
-    if (start < 0)  start += dim;
-    return (step > 0) ? ss_clamp(start, 0, dim) : ss_clamp(start, 0, dim - 1);
-}
-static inline long ss_stop_for_axis(long stop, long step, bool end_mask, bool shrink,
-                                    long start, long dim) {
-    if (dim == 0) return 0;
-    if (shrink)    return start + 1;                            // 1-elem slice, end irrelevant
-    if (end_mask)  stop = (step > 0) ? LONG_MAX : LONG_MIN;
-    if (stop < 0)  stop += dim;
-    return (step > 0) ? ss_clamp(stop, 0, dim) : ss_clamp(stop, -1, dim - 1);
+// One STRIDED_SLICE axis resolved to its walk: start, start+step, ... stopping before `stop`.
+// A masked bound takes the end of the axis in the walk's direction, a negative bound counts
+// from the end, and an explicit bound is clamped into the axis: [0, dim] for a forward walk,
+// [0, dim-1] for a backward one, whose stop may also sit at -1, before index 0. A shrink axis
+// is the single element at the resolved start. Both bounds resolve here, together, because a
+// shrink axis's stop depends on the resolved start. The bounds arrive as longs so an int
+// sentinel cannot overflow when a negative bound is offset by `dim`.
+static inline void ss_axis_range(long begin, long end, long step, bool begin_mask,
+                                 bool end_mask, bool shrink, long dim, long *start, long *stop)
+{
+    if (dim == 0) { *start = *stop = 0; return; }
+    const bool fwd  = step > 0;
+    const long last = fwd ? dim : dim - 1;
+    long s = begin_mask ? (fwd ? 0 : dim - 1) : (begin < 0 ? begin + dim : begin);
+    s = s < 0 ? 0 : (s > last ? last : s);
+    long e;
+    if (shrink)        e = s + 1;
+    else if (end_mask) e = fwd ? dim : -1;
+    else {
+        const long first = fwd ? 0 : -1;
+        e = end < 0 ? end + dim : end;
+        e = e < first ? first : (e > last ? last : e);
+    }
+    *start = s;
+    *stop  = e;
 }
 
 // STRIDED_SLICE — the strided/masked generalization of SLICE. The begin/end/strides
@@ -1554,10 +1562,10 @@ static bool analyze_strided_slice(const TfLiteNode *node, TfLiteContext *ctx, No
         stride[id] = (int)step; if (step != 1) strided = true;
         const long dim = in.dims->data[id];
         const bool shrink = (p->shrink_axis_mask >> s) & 1;
-        const long start = ss_start_for_axis(read_const_int(bg, s), step,
-                                             (p->begin_mask >> s) & 1, dim);
-        const long stop  = ss_stop_for_axis(read_const_int(en, s), step,
-                                            (p->end_mask >> s) & 1, shrink, start, dim);
+        long start, stop;
+        ss_axis_range(read_const_int(bg, s), read_const_int(en, s), step,
+                      (p->begin_mask >> s) & 1, (p->end_mask >> s) & 1, shrink, dim,
+                      &start, &stop);
         if (shrink) {                                               // take one index, drop axis
             if (start < 0 || start >= dim) return false;
             begin[id] = (int)start; size[id] = 1;                  // stride irrelevant on a 1-elem axis

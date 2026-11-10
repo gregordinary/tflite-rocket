@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The tflite-rocket authors
 # Frigate configuration — RK3588 NPU (rocket) detector.
 #
 # This config drives the `rocket` detector (rocket.py) against an SSDLite-MobileDet

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 The tflite-rocket authors
 # Frigate with the RK3588 NPU (rocket) detector.
 #
 # Build the image first — see frigate/README.md: build the delegate .so on an RK3588

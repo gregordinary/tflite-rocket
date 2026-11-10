@@ -1671,21 +1671,22 @@ static int run_resize(const ResizeT &s) {
     for (size_t i = 0; i < in_n; i++) in[i] = (float)((int)(i % 19) - 9) * 0.5f;
     if (s.bilinear) rocket_resize_bilinear_f(in.data(), got.data(), s.IH, s.IW, s.C, s.OH, s.OW, s.ac, s.hp);
     else            rocket_resize_nearest_f (in.data(), got.data(), s.IH, s.IW, s.C, s.OH, s.OW, s.ac, s.hp);
-    /* independent oracle: same TFLite coordinate transform, recomputed inline */
+    /* oracle: each output pixel resolves its axes afresh (the kernels resolve them once per
+     * call), then samples and interpolates inline */
     for (int oh = 0; oh < s.OH; oh++)
         for (int ow = 0; ow < s.OW; ow++)
             for (int c = 0; c < s.C; c++) {
+                const rocket_resize_axis ay = rocket_resize_axis_init(s.IH, s.OH, s.ac, s.hp);
+                const rocket_resize_axis ax = rocket_resize_axis_init(s.IW, s.OW, s.ac, s.hp);
                 float v;
                 if (!s.bilinear) {
-                    int ih = rocket_nn_src(oh, s.IH, s.OH, s.ac, s.hp);
-                    int iw = rocket_nn_src(ow, s.IW, s.OW, s.ac, s.hp);
+                    int ih = rocket_resize_nearest_at(&ay, oh);
+                    int iw = rocket_resize_nearest_at(&ax, ow);
                     v = in[((size_t)ih*s.IW + iw)*s.C + c];
                 } else {
-                    float fy = rocket_bilin_src(oh, s.IH, s.OH, s.ac, s.hp);
-                    if (fy<0) fy=0; if (fy>s.IH-1) fy=s.IH-1;
+                    float fy = rocket_resize_linear_at(&ay, oh);
                     int y0=(int)floorf(fy), y1=y0<s.IH-1?y0+1:y0; float wy=fy-y0;
-                    float fx = rocket_bilin_src(ow, s.IW, s.OW, s.ac, s.hp);
-                    if (fx<0) fx=0; if (fx>s.IW-1) fx=s.IW-1;
+                    float fx = rocket_resize_linear_at(&ax, ow);
                     int x0=(int)floorf(fx), x1=x0<s.IW-1?x0+1:x0; float wx=fx-x0;
                     float a=in[((size_t)y0*s.IW+x0)*s.C+c], b=in[((size_t)y0*s.IW+x1)*s.C+c];
                     float cc=in[((size_t)y1*s.IW+x0)*s.C+c], d=in[((size_t)y1*s.IW+x1)*s.C+c];
