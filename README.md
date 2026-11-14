@@ -485,7 +485,7 @@ patches:
 
 ## License and credits
 
-`tflite-rocket` is MIT-licensed; see [LICENSE](LICENSE). It targets
+`tflite-rocket` is MIT-licensed. See [LICENSE](LICENSE). It targets
 [TensorFlow Lite](https://www.tensorflow.org/lite) (Apache-2.0) as an external delegate and uses the
 `rocket-userspace` driver for the NPU. The Frigate detector plugin and Compose file follow
 Frigate's (MIT) detector plugins and documentation, and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)
