@@ -20,7 +20,9 @@
 # the part's requant cannot produce. The mAP delta is reported, not asserted.
 #
 # The interpreter comes from tflite_runtime, ai_edge_litert or tensorflow, whichever is
-# installed — an aarch64 board has the first two and no TFLite build.
+# installed — an aarch64 board has the first two and no TFLite build. Under LiteRT, run with
+# LD_PRELOAD=<build>/libtflite_cshim.so: it supplies the two C-API symbols the delegate binds
+# at load, and without it the counter read fails with "undefined symbol: TfLiteIntArrayCreate".
 import argparse, json, os, sys
 import numpy as np
 from PIL import Image
