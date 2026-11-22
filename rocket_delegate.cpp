@@ -151,10 +151,13 @@ struct RocketOptions {
                                 // takes (direct_i8out's uint8 per-tensor convs, direct_perc's
                                 // per-axis int8 ones) runs on it instead of the resident int8
                                 // matmul when its plane has at least this many pixels; direct_perc
-                                // also leaves a smaller conv on the int32-raw route. The writer won
-                                // every measured 1x1 at 400 pixels and up and lost most at 100, so
-                                // 256 sits between the measured sides. MobileDet 1.95-2.00x
-                                // unpinned, 1.37-1.41x pinned. 0 keeps every 1x1 on the matmul.
+                                // also leaves a smaller conv on the int32-raw route. The writer is
+                                // faster on every measured 1x1 at 400 pixels and up and slower on
+                                // every one at 100, so 256 sits between the measured sides. Of
+                                // 0/100/256/400 it is within 1.4% of the fastest on MobileDet, SSD
+                                // MobileNet v2 and EfficientDet-Lite0; 0 costs 1.17-1.33x, 100
+                                // 1.04-1.08x (2026-11-22, 1028 MHz, SPLL programmed, pinned).
+                                // 0 keeps every 1x1 on the matmul.
     bool mm_int8 = true;        // perf Step 1: route native int8/uint8 1x1 DIRECT convs to the
                                 // RESIDENT multicore int8 matmul (rocket_matmul_int8_prepacked)
                                 // instead of the single-core conv pool. A 1x1 IS a matmul; the
@@ -169,10 +172,20 @@ struct RocketOptions {
                                 // standalone NPU LUT pass is an extra round-trip), so this is an
                                 // A/B / demonstration toggle for the on-NPU nonlinearity. Falls
                                 // back to the host kernel with no device or on a LUT failure.
-    bool fc_npu = false;        // run a claimed FULLY_CONNECTED on the NPU resident matmul
-                                // instead of the host matmul. OFF: the host matmul beats the
-                                // dispatch-bound NPU for one-shot TFLite FC (not-mac-bound);
-                                // on, for large batched / repeated FC (M%4; M==1 stays host).
+    int  fc_npu = -1;           // where a claimed FULLY_CONNECTED with M%4==0 runs: the NPU resident
+                                // fp16 matmul or the host matmul (fp32, single-threaded, scalar,
+                                // 2.1-2.3 GFLOP/s); M==1 stays on the host under every setting.
+                                // -1 (auto, the default): the NPU when M*K*N reaches
+                                // fc_npu_min_macs. 1: the NPU at every M%4==0. 0: the host.
+                                // Measured 2026-11-22 (1028 MHz, SPLL programmed): the NPU takes
+                                // 0.072-0.079x the host's time at 4x1024x1001 and 0.008-0.009x
+                                // at 64x1024x1024 and 512x1024x512; the host is faster only at
+                                // 4x256x90 (the NPU 1.59-1.75x its time).
+    long fc_npu_min_macs = 524288; // fc_npu=-1's floor, in M*K*N multiply-accumulates. The NPU
+                                // took 0.14 ms at 4x256x90 (92K MACs) and 0.27 ms at 4x1024x1001
+                                // (4.1M); interpolating those, it meets the host's 2.2 GFLOP/s near
+                                // 150K MACs, and at 512K the host takes ~3x the NPU's time
+                                // [expected, from those two layers].
     bool ew_npu = false;        // run a claimed MAXIMUM / MINIMUM on the NPU DPU EW ALU
                                 // (rocket_ew_max/min_fp16) instead of the exact host kernel.
                                 // OFF: like ADD these are memory-bound, so the host kernel is
@@ -2033,7 +2046,7 @@ public:
                 // pool_npu) silently computing on the CPU oracle is surprising, so warn
                 // once even without profile; the bare default-conv case stays profile-gated.
                 const bool npu_requested = opts_.native_int8 || opts_.act_npu ||
-                                           opts_.fc_npu || opts_.pool_npu || opts_.ew_npu ||
+                                           opts_.fc_npu > 0 || opts_.pool_npu || opts_.ew_npu ||
                                            opts_.resize_npu || opts_.norm_npu;
                 if (npu_requested)
                     fprintf(stderr, "[rocket] an on-NPU path was requested but no NPU device "
@@ -2097,14 +2110,21 @@ public:
         for (Node &n : nodes_) {
             if (n.kind != NodeKind::FC) continue;
             FCNode &f = n.fc;
-            // FC defaults to the HOST matmul (rocket_fc_f): exact, and for a ONE-SHOT TFLite
-            // FC it beats the NPU, which is DMA/dispatch-bound (pack+readback ~67% of wall,
-            // the not-mac-bound finding) — even a 512x1024x512 FC is ~85 ms on the NPU vs
-            // ~27 ms host; the resident matmul only wins at LLM-prefill scale / repeated calls.
-            // So the NPU path is opt-in (fc_npu=1), and only for a GEMM-shaped M%4 FC (M==1 is
-            // a GEMV the NPU runs ~80x slower). mm_w==null => host. Claiming FC regardless keeps
+            // An M%4 FC runs on the resident fp16 matmul (weight packed here, once) when fc_npu
+            // asks for it: always at 1, from fc_npu_min_macs at -1 (the default). The host
+            // matmul (rocket_fc_f) is fp32, a single-threaded scalar loop at 2.1-2.3 GFLOP/s, and
+            // M==1 stays on it (not measured on the NPU through the delegate). The NPU route is
+            // faster at every measured M%4 layer but the smallest: 512x1024x512 is 2.1 ms
+            // against 233 ms on the host, 4x1024x1001 0.27 against 3.6 ms, and 4x256x90 (below
+            // the auto floor) 0.14 against 0.086 ms (2026-11-22, 1028 MHz, SPLL programmed,
+            // pinned). Its output differs from fp32 TFLite by up to 1.2e-3-2.5e-3 on those
+            // layers, the fp16 rounding the delegate's float convs also carry.
+            // mm_w==null => host. Claiming FC regardless keeps
             // the partition contiguous + covers the op (like the aux host kernels).
-            const bool want = opts_.fc_npu && fd_ >= 0 && (f.M % 4 == 0);
+            const long fc_macs = (long)f.M * f.K * f.N;
+            const bool want = fd_ >= 0 && (f.M % 4 == 0) &&
+                              (opts_.fc_npu > 0 ||
+                               (opts_.fc_npu < 0 && fc_macs >= opts_.fc_npu_min_macs));
             if (f.mm_w && (!want || f.mm_M != f.M)) {
                 rocket_weights_free(mm_ctx_, f.mm_w);
                 f.mm_w = nullptr;
@@ -3982,7 +4002,9 @@ TfLiteDelegate *tflite_plugin_create_delegate(
         else if (k == "direct_perc")   opts.direct_perc   = (rocket_opt_long("direct_perc", v, 1) != 0);
         else if (k == "pw_i8out_min_m") opts.pw_i8out_min_m = (int)rocket_opt_long("pw_i8out_min_m", v, 256);
         else if (k == "act_npu")       opts.act_npu       = (rocket_opt_long("act_npu", v, 0) != 0);
-        else if (k == "fc_npu")        opts.fc_npu        = (rocket_opt_long("fc_npu", v, 0) != 0);
+        else if (k == "fc_npu")        { const long x = rocket_opt_long("fc_npu", v, -1);
+                                         opts.fc_npu = x < 0 ? -1 : (x != 0); }
+        else if (k == "fc_npu_min_macs") opts.fc_npu_min_macs = rocket_opt_long("fc_npu_min_macs", v, 524288);
         else if (k == "pool_npu")      opts.pool_npu      = (rocket_opt_long("pool_npu", v, 0) != 0);
         else if (k == "ew_npu")        opts.ew_npu        = (rocket_opt_long("ew_npu", v, 0) != 0);
         else if (k == "resize_npu")    opts.resize_npu    = (rocket_opt_long("resize_npu", v, 0) != 0);
