@@ -53,7 +53,9 @@ On the RK3588 the delegate runs one op at a time:
   activations, the elementwise and layout ops, resize, softmax and more. The delegate claims them
   and computes them with host kernels inside its own kernel, so a MobileNet or SSD backbone is one
   partition. Opt-in options move some of them to the NPU.
-- **`FULLY_CONNECTED`**, float: a host matmul by default, and the NPU under `fc_npu=1`.
+- **`FULLY_CONNECTED`**, float: the resident fp16 matmul for a layer whose batch is a multiple
+  of 4 and that has at least 524288 multiply-accumulates. A host matmul runs every other layer,
+  and the `fc_npu` and `fc_npu_min_macs` options set the split.
 
 On the RK3576 the delegate runs each delegated partition as one planned network, the
 [RK3576 graph](#the-rk3576), at int8 and uint8.
@@ -247,7 +249,20 @@ NPU clock follows the rail voltage, so a requested rate is not the rate the NPU 
 Apply the `patches/rocket` clock and voltage patches, and load the module with
 `rocket_npu_clk_hz=900000000`. On the RK1's 0.80 V rail that request runs the NPU at 928 MHz. The
 [Performance](#performance) figures were measured there. The other RK3588 figures in this README
-were measured with the 600 MHz request, which runs at ~816 MHz on the same rail.
+were measured with the 600 MHz request, which runs at ~816 MHz on the same rail. The rate also
+differs between parts: a second RK1 runs the 900 MHz request at 1028 MHz, and a figure from it
+states that clock.
+
+The boot loader sets the rate at which the NPU reads DDR. The NPU reads through the center
+interconnect, which runs from SPLL, a PLL that only the boot loader's SPL stage can program.
+Behind a boot loader that leaves SPLL unprogrammed, the NPU reads DDR at half the rate, and
+`clk_summary` still reports 702 MHz.
+
+Mainline U-Boot v2026.07 and v2026.10 leave SPLL unprogrammed on the RK1's eMMC boot
+[HW sweep 2026-11-21]. Upstream U-Boot commit `514663543ecf`, first released in v2027.01-rc2,
+programs it. A figure on the mainline driver that was measured with SPLL programmed says so in
+its Conditions line. The other figures on that driver were measured on an RK1 booting 2026
+mainline U-Boot releases, with SPLL unprogrammed [hypothesis].
 
 > [!CAUTION]
 > With the NPU cores pinned on (`power/control=on`), an `rmmod` at the 900 MHz request
@@ -357,7 +372,7 @@ The convolution glue and the layout ops are exact (`max_abs=0.0000`, `max|dq|=0`
 device the PPU average pool within 0.06. `RESIZE_*`, `SOFTMAX`, `LOG_SOFTMAX` and `CUMSUM` have
 float cases only. `boxsum_bench` checks the three box-sum implementations against each other.
 
-The delegate options, `nthreads`, `aux_ops`, the opt-in `*_npu` routes, `nchw_resident` and the
+The delegate options, `nthreads`, `aux_ops`, the `*_npu` routes, `nchw_resident` and the
 rest, are in [Delegate options](API.md#delegate-options).
 
 ### On a BSP kernel
@@ -389,10 +404,11 @@ hash.
 **Conditions:** two RK3588 (Turing RK1) boards, one per driver, both NPUs at the 600 MHz request,
 the delegate as built on 2026-08-26.
 
-**Not characterized:** the NPUs' physical clocks, which follow each kernel's rail voltage, so the
-latency comparison is not clock-matched. Also the int8-out routes that `native_int8=1` takes by
-default (`direct_i8out`, `direct_perc`, `pw_i8out_min_m`, `dw_perc` and the uint8 depthwise),
-which have not run on the BSP driver through the delegate.
+**Not characterized:** the NPUs' physical clocks, which follow each kernel's rail voltage, and
+the two boards' boot loaders, which differ. The latency comparison is matched for neither. Also
+the int8-out routes that `native_int8=1` takes by default (`direct_i8out`, `direct_perc`,
+`pw_i8out_min_m`, `dw_perc` and the uint8 depthwise), which have not run on the BSP driver
+through the delegate.
 
 ## Troubleshooting
 
@@ -403,8 +419,8 @@ Most often XNNPACK claimed the convolutions first. Load the interpreter with
 run once with `profile=1` to see each convolution's route.
 
 If the process cannot open `/dev/accel/accel0`, the RK3588 routes compute on the CPU, correctly
-and slowly. Under `native_int8=1` or a `*_npu` option the delegate prints `an on-NPU path was
-requested but no NPU device opened (-13)`. Under the default options it prints nothing, and
+and slowly. Under `native_int8=1` or a `*_npu` option set to `1`, the delegate prints `an on-NPU
+path was requested but no NPU device opened (-13)`. Under the default options it prints nothing, and
 `profile=1` prints `no NPU device (-13); conv runs on the CPU oracle`. The number is the negative
 errno from the open, and `-13` is permission denied. Check that the node exists and that the
 process can open it:

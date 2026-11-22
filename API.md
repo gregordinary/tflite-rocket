@@ -51,7 +51,7 @@ and runs on the interpreter's CPU kernels.
 | `CONV_2D` and `DEPTHWISE_CONV_2D`, int8 or uint8 | The fp16 route: dequantized to fp16 at the boundary, the fp16 convolution, requantized on the host ([The fp16 route](#the-fp16-route)) | Supported (default) |
 | `CONV_2D`, int8 or uint8, under `native_int8=1` | The native int8 routes. [Native int8 routes](#native-int8-routes) gives which convolution takes which | Supported (opt-in) |
 | `DEPTHWISE_CONV_2D`, int8 or uint8, under `native_int8=1` | The native depthwise routes, `rocket_conv2d_dw_int8` and `rocket_conv2d_dw_int8_perc`, in [Native int8 routes](#native-int8-routes) | Supported (opt-in) |
-| `FULLY_CONNECTED`, float, constant weight, `M%4==0` or `M==1` | The host matmul, `rocket_fc_f`, which is faster than the NPU for a one-shot layer. `fc_npu=1` sends an `M%4==0` layer to the resident fp16 matmul with K padded to 32 and N to 16, and `M==1` stays on the host. Claimed whatever `aux_ops` is | Supported (default) |
+| `FULLY_CONNECTED`, float, constant weight, `M%4==0` or `M==1` | An `M%4==0` layer of at least `fc_npu_min_macs` multiply-accumulates runs on the resident fp16 matmul, with K padded to 32 and N to 16. Every other layer, and an `M==1` layer under every setting, runs on the host matmul `rocket_fc_f`. `fc_npu` sets the split, and [`FULLY_CONNECTED`](#fully_connected) compares the two. Claimed whatever `aux_ops` is | Supported (default) |
 | `HARD_SWISH`, `LOGISTIC`, `TANH`, `ELU`, `LOG`, `RELU`, `RELU6`, `RELU_N1_TO_1`, `LEAKY_RELU`, `EXP`, `SQRT`, `RSQRT`, `ABS`, `NEG`, `SQUARE`, `FLOOR` | Host kernels `rocket_unary_f` and `rocket_unary_q`, the quantized form through a 256-entry table. The `RELU` family, `NEG`, `SQUARE`, `FLOOR` and `ABS` are exact float arithmetic, and `EXP`, `SQRT`, `RSQRT` and `LEAKY_RELU` are libm-exact. `act_npu=1` sends the curved kinds to the DPU LUT (below the table) | Supported (default) |
 | `MAXIMUM`, `MINIMUM`, same shape or broadcast | Host kernels `rocket_binary_f` and `rocket_binary_q`. `ew_npu=1` sends a float same-shape pair to the DPU EW ALU, `rocket_ew_max_fp16` and `rocket_ew_min_fp16`, bit-identical to the host | Supported (default) |
 | `ADD`, `MUL`, `SUB`, `DIV`, same shape or broadcast, fused activation | Host kernels (`ADD` in `rocket_ops.h`, the others `rocket_arith_f` and `rocket_arith_q`). `SUB` and `DIV` compute `in0 op in1` | Supported (default) |
@@ -113,6 +113,62 @@ A broadcasting two-tensor op, per-channel `[C]`, scalar or general right-aligned
 materialized to the output shape (`rocket_broadcast_copy`). The same-shape host kernel then runs,
 bit-exact. Those are the SE-block scale and bias-add forms. `convert_test` checks each host op
 against an independent NHWC reference.
+
+### `FULLY_CONNECTED`
+
+A float `FULLY_CONNECTED` runs on one of two matmuls. By default, an `M%4==0` layer of at least
+524288 multiply-accumulates (`M·K·N`) runs on the resident fp16 matmul, its weight packed once at
+Prepare. Every other layer runs on the host matmul `rocket_fc_f`, a single-threaded scalar loop
+that accumulates in fp32. It runs at 2.1-2.3 GFLOP/s on the layers below. `fc_npu` and
+`fc_npu_min_macs` set the split ([Delegate options](#delegate-options)).
+
+The NPU route is faster than the host matmul on every layer measured except the smallest. The
+default sends each of these layers to the faster route:
+
+| Layer, M×K×N | Multiply-accumulates | Default route | Host matmul, `fc_npu=0` | NPU, `fc_npu=1` | NPU time against the host's |
+|---|---:|---|---:|---:|---:|
+| 4×256×90 | 92K | Host | 0.085-0.087 ms | 0.137-0.149 ms | 1.59-1.75x |
+| 4×1024×1001 | 4.1M | NPU | 3.62-3.64 ms | 0.262-0.287 ms | 0.072-0.079x |
+| 64×1024×1024 | 67M | NPU | 58.2-58.7 ms | 0.470-0.487 ms | 0.0080-0.0084x |
+| 512×1024×512 | 268M | NPU | 232.4-233.7 ms | 2.07-2.15 ms | 0.0089-0.0092x |
+
+An `M==1` layer runs on the host under every setting, and a 1×1024×1001 layer took 0.90 ms under
+each. The NPU route rounds the input, the weight and the output to fp16, as the delegate's float
+convolutions do. Its largest difference from the CPU interpreter on these layers was 1.2e-3 to
+2.5e-3, against 4.6e-6 or less for the host matmul.
+
+The default threshold lies between the two smallest layers measured. Interpolated between them,
+the NPU's time is expected to equal the host matmul's near 150K multiply-accumulates [expected].
+At 524288 the host matmul is expected to take ~3x the NPU's time [expected].
+
+SSDLite-MobileDet, SSD MobileNet v2 and EfficientDet-Lite0 have no `FULLY_CONNECTED` the delegate
+claims, so `fc_npu` does not change their invoke time [HW sweep 2026-11-22].
+
+**Conditions:** RK3588 (Turing RK1), the mainline `rocket` driver (kernel 7.3.3, `rocket`
+1.3.0), NPU at 1028 MHz (the 900 MHz request), a boot loader that programs SPLL
+([Clock](README.md#clock)). CPU governor `performance`, the process on the A76 cores
+(`taskset -c 4-7`), `nthreads=4`, warm. Float layers with a bias and no fused activation, from
+`tools/make_fc_tflite.py` [HW sweep 2026-11-22].
+
+#### Evidence
+
+Each time is the median of invokes 6-35 of one process, run through `tools/run_delegate.py
+--compare --iters 35` with `profile=1`, which named the route of every invoke. Four passes ran
+with the layer and setting order rotated, memory reset before each process, after one discarded
+warm-up process. Every NPU invoke returned the first invoke's output.
+
+The default-route column is from four more passes of the same method with `fc_npu` unset. In each
+process, `profile=1` named one route for all 35 invokes. With `fc_npu` unset, the three NPU
+layers took 0.948-1.053x their `fc_npu=1` time, and 4×256×90 took 0.977-1.012x its `fc_npu=0`
+time. The largest difference from the CPU interpreter matched the forced setting's on every layer.
+
+The detectors ran under `native_int8=1` on one image, 5 warm-up and 30 timed invokes, with
+`fc_npu` unset and at `0`. Two passes ran with the model and setting order rotated, and no process
+printed an `fc` op line under `profile=1`. With `fc_npu` unset, SSD MobileNet v2 and
+EfficientDet-Lite0 took 0.998-1.008x their `fc_npu=0` time. MobileDet processes ran at either
+~47.5 or ~52.6 ms under every setting, the slower ones slower on every convolution. In six more
+passes that added an explicit `fc_npu=-1`, its fast processes took 0.978-1.030x their `fc_npu=0`
+time.
 
 ## Quantized convolutions
 
@@ -220,20 +276,58 @@ BS stage's per-channel multiplier. TFLite quantizes a depthwise filter per chann
 | `dw_perc` | EfficientDet-Lite0 | 1.095-1.104x | Not characterized | 0.2998 (fp16 route) -> 0.3019 | 0.2996 |
 | `direct_i8out` | MobileDet | 1.22-1.27x | 1.21-1.22x | 0.3990 -> 0.3994 | Not characterized |
 | `direct_i8out` | SSD MobileNet v2 | 1.19-1.20x | 1.17x | 0.3197 -> 0.3213 | 0.3215 |
-| `pw_i8out_min_m=256` | MobileDet | 1.37-1.41x | 1.95-2.00x | 0.3994 -> 0.4040 | 0.3980 |
-| `pw_i8out_min_m=256` | SSD MobileNet v2 | 1.23-1.28x | 1.90x | 0.3213 -> 0.3229 | 0.3215 |
 | `direct_perc` | EfficientDet-Lite0 | 1.21-1.25x | 1.29-1.33x | 0.3019 -> 0.3023 | 0.2996 |
 
 **Conditions:** RK3588 (Turing RK1), the mainline `rocket` driver, NPU at ~816 MHz (the 600 MHz
 request), warm. Each speedup is against the build before the route, and the routes were added in
-the table's order. The `performance` column has the governor pinned and the process on the A76
-cores (`taskset -c 4-7`). The `ondemand` column has `scaling_min_freq` at 1.2 GHz. mAP@[.5:.95] is
-over 100 COCO val2017 images. Measured 2026-09-27 and 2026-09-28.
+the table's order. The `direct_perc` row ran with `pw_i8out_min_m=256`. The `performance` column
+has the governor pinned and the process on the A76 cores (`taskset -c 4-7`). The `ondemand`
+column has `scaling_min_freq` at 1.2 GHz. Measured 2026-09-27 and 2026-09-28, with mAP@[.5:.95]
+over 100 COCO val2017 images.
 
-With `pw_i8out_min_m=256`, 1×1 convolutions of 16×16 pixels and up move from the int8 matmul to
-the int8-out direct convolution. Its output needs no int32 readback or host requant. The matmul
-route also loses more to parked cores: on `ondemand` its time is 1.95x its pinned time, against
-the direct route's 1.36x.
+#### `pw_i8out_min_m`
+
+A 1×1 convolution that `direct_i8out` or `direct_perc` takes runs on the resident int8 matmul
+below `pw_i8out_min_m` pixels, with an int32 readback and the host requant. From that plane up
+it runs on the int8-out direct convolution, which writes int8 output. That route is faster on
+every measured 1×1 with an output plane of 400 pixels or more, and slower on every one at 100
+pixels:
+
+| Output plane | MobileDet | SSD MobileNet v2 |
+|---|---|---|
+| 100 pixels (10×10) | Slower on 12 of 12, 1.04-2.85x | Slower on 11 of 11, 1.21-2.94x |
+| 400 pixels (20×20) | Faster on 16 of 16, 0.53-0.94x | No such layer |
+| 1444-1600 pixels | Faster on 5 of 5, 0.48-0.61x | Faster on 6 of 6, 0.34-0.99x |
+| 6400-25600 pixels | Faster on 6 of 6, 0.25-0.53x | No such layer |
+
+Each ratio is a convolution's time on the int8-out route against its time on the int8 matmul.
+The default, 256 pixels, falls between the two measured planes. Of the values 0, 100, 256 and
+400, it is within 1.4% of the fastest on each of three detectors:
+
+| Detector | Invoke time at `256` | At `0` | At `100` | At `400` |
+|---|---:|---:|---:|---:|
+| SSDLite-MobileDet | 47.3-48.6 ms | 1.29-1.33x | 1.04-1.08x | 0.987-1.022x |
+| SSD MobileNet v2 | 43.3-43.8 ms | 1.24-1.26x | 1.06-1.08x | 0.988-1.004x |
+| EfficientDet-Lite0 | 87.6-88.5 ms | 1.17-1.23x | 1.05-1.06x | 1.000-1.011x |
+
+The last three columns give each value's invoke time against the default's. On
+EfficientDet-Lite0 the threshold also keeps `direct_perc` off its 9- and 25-pixel planes, where
+the int32 route takes 0.47-0.88x the int8-out route's time.
+
+**Conditions:** RK3588 (Turing RK1), the mainline `rocket` driver (kernel 7.3.3, `rocket`
+1.3.0), NPU at 1028 MHz (the 900 MHz request), a boot loader that programs SPLL
+([Clock](README.md#clock)). CPU governor `performance`, the process on the A76 cores
+(`taskset -c 4-7`). `native_int8=1`, `nthreads=4` and `profile=1`, warm, on one image. An invoke
+time is the median of 30 invokes, and a convolution's time the median of its 30
+[HW sweep 2026-11-22].
+
+**Not characterized:** `ondemand` on this build. On 2026-09-27, at ~816 MHz (the 600 MHz request),
+MobileDet with its 1×1s on the int8 matmul took 1.95x its pinned time on `ondemand`. Under the
+default threshold it took 1.36x.
+
+The 1×1s the default moves change mAP@[.5:.95] over 100 COCO val2017 images from 0.3994 to
+0.4040 on MobileDet, against the CPU interpreter's 0.3980. On SSD MobileNet v2 they change it
+from 0.3213 to 0.3229, against 0.3215 [HW sweep 2026-09-27].
 
 #### Evidence
 
@@ -245,9 +339,21 @@ in that step, so its 0.3157 is the native depthwise row's result. With those two
 the int8 route in row bands, its mAP measured 0.3197.
 
 On `performance`, EfficientDet-Lite0 measured 133 -> 121 ms under `dw_perc` and 123 -> 101 ms
-under `direct_perc`. MobileDet measured 93 -> 75 ms under `direct_i8out` and 77 -> 56 ms under
-`pw_i8out_min_m`, and 150 -> 76 ms on `ondemand`. The 256-pixel threshold was measured on both
-sides, at 100 and 400 pixels.
+under `direct_perc`. MobileDet measured 93 -> 75 ms under `direct_i8out`.
+
+The `pw_i8out_min_m` figures of 2026-11-22 are from four passes with the model and value order
+rotated. Each process followed a memory reset and ran 5 warm-up and 30 timed invokes, after one
+discarded warm-up process. A convolution's time is from `profile=1`'s per-op lines. The
+comparison is `pw_i8out_min_m=100` against `0`, which differ only in the route of the 1×1s of
+100 pixels and up. One MobileDet process at `100` ran every op 2.6x slow, the 6400- and
+25600-pixel convolutions included, and the comparison leaves it out.
+
+On 2026-09-27, at ~816 MHz (the 600 MHz request), `pw_i8out_min_m=256` gave a 1.37-1.41x
+speedup over the build before it on MobileDet and 1.23-1.28x on SSD MobileNet v2, on
+`performance`. On `ondemand` it gave 1.95-2.00x and 1.90x. MobileDet measured 77 -> 56 ms on
+`performance` and 150 -> 76 ms on `ondemand`. That build compared 39 convolutions on both
+routes. The int8-out route was faster on all 27 at 400 pixels or more, and the int8 matmul on 8
+of the 12 at 100 pixels.
 
 ### `nchw_resident`
 
@@ -324,9 +430,11 @@ string.
 | `dw_perc` | `1` | Sends a per-axis int8 depthwise to `rocket_conv2d_dw_int8_perc` (RK3588). Active only under `native_int8`. `0` keeps it on the fp16 route |
 | `direct_i8out` | `1` | Sends a uint8 convolution with per-tensor weights to the int8-out entry `rocket_conv2d_int8_q` (RK3588). Active only under `native_int8`. `0` keeps the int32 route, whose host requant is TFLite's |
 | `direct_perc` | `1` | Sends a signed int8 convolution with per-axis symmetric weights and an output plane of at least `pw_i8out_min_m` pixels to `rocket_conv2d_int8_q_perc` (RK3588). Active only under `native_int8`. `0` keeps the int32 route |
-| `pw_i8out_min_m` | `256` | The plane size, in pixels, from which a 1×1 that `direct_i8out` or `direct_perc` takes runs on the int8-out direct convolution instead of the int8 matmul, and from which `direct_perc` applies. `0` keeps every eligible 1×1 on the matmul and lets `direct_perc` take any plane. Active only under `native_int8` |
+| `pw_i8out_min_m` | `256` | The plane size, in pixels, from which a 1×1 that `direct_i8out` or `direct_perc` takes runs on the int8-out direct convolution instead of the int8 matmul, and from which `direct_perc` applies. `0` keeps every eligible 1×1 on the matmul and lets `direct_perc` take any plane. Active only under `native_int8`, where the default is within 1.4% of the fastest value measured on three detectors ([`pw_i8out_min_m`](#pw_i8out_min_m)) |
 | `nthreads` | `4` | Worker count, clamped to 1-8. It sizes the 1×1 matmul fan-out across the three NPU cores, the native direct-convolution pool `rocket_conv_pool`, the host requant and box-sum fan-out, and the matmul context `FULLY_CONNECTED` uses |
 | `min_macs` | `0` | The smallest convolution to claim, in `OC·OH·OW·IC·KH·KW` (`OC·OH·OW·KH·KW` for a depthwise). `0` claims every supported convolution |
+| `fc_npu` | `-1` | Where a float `FULLY_CONNECTED` with `M%4==0` runs, with a device open. `-1` (any negative value) sends a layer of at least `fc_npu_min_macs` multiply-accumulates to the resident fp16 matmul, `1` (any positive value) every layer, and `0` none. The rest, and every `M==1` layer, run on the host matmul ([`FULLY_CONNECTED`](#fully_connected)) |
+| `fc_npu_min_macs` | `524288` | The smallest layer, in `M·K·N` multiply-accumulates, that `fc_npu=-1` sends to the NPU. No effect at another `fc_npu` value |
 | `aux_ops` | `1` | Claims the host ops listed below. `0` restricts the delegate to the convolutions and `FULLY_CONNECTED` |
 | `profile` | `0` | Prints per-op timing to stderr: the `breakdown in/conv/out` split, the resident set, and each convolution's route and input plane |
 | `nchw_resident` | `0` | Keeps tensors between fp16-route convolutions in fp16 NCHW. [`nchw_resident`](#nchw_resident) has the detail |
@@ -362,7 +470,6 @@ Some claimed ops also have an opt-in NPU route, each defaulting to `0`:
 | `pool_npu` | Float `AVERAGE_POOL_2D` (`VALID` padding only), `MAX_POOL_2D`, `MEAN` and `REDUCE_*`, on the PPU |
 | `resize_npu` | A float nearest resize at an integer factor |
 | `norm_npu` | Float `L2_NORMALIZATION` |
-| `fc_npu` | `FULLY_CONNECTED` with `M%4==0`, with a device open |
 
 ## Environment variables
 
